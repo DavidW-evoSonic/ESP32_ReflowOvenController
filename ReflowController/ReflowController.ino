@@ -9,12 +9,25 @@
 //#define NOEDGEERRORREPORT 
 
 //Pin Mapping
-// TODO: not yet decided -- change this one line when the hardware is fixed.
-// Must be non-strapping and output-capable. Note 25/26 (suggested in the rework
-// notes) are NOT available: they stay claimed by BUZZER and RGB_SDO. Freed by
-// this rework and safe to use: 17, 16 (the original heater pins, already routed
-// for heater duty), 27, 23, 22, 4, 33. Defaulting to 17.
-#define HEATER      17
+// One of the two original heater pins, so it is already routed for heater duty
+// on the board. Non-strapping and output-capable.
+//
+// Note 25/26 -- suggested in the original rework notes -- are NOT available:
+// they stay claimed by BUZZER and RGB_SDO. Still free if this ever has to
+// move: 17 (the other original heater pin), 27, 23, 22, 4, 33.
+//
+// Two things this pin choice depends on, neither visible from the firmware:
+//
+// 1. 16 and 17 are the PSRAM interface on WROVER modules. This assumes a plain
+//    WROOM with no PSRAM, which is also what platformio.ini assumes. If the
+//    board turns out to carry PSRAM, this pin is not free -- move it to 27.
+//
+// 2. Nothing drives this pin between reset and the pinMode() in setup(): it is
+//    a floating input for the whole of boot, and Serial.begin() and the ADC
+//    setup happen first. The relay drive circuit therefore needs its own
+//    pull-down to hold the heater off through that window. This is a hardware
+//    requirement, not something the firmware can arrange for itself.
+#define HEATER      16
 
 // AD595 analog output. Must be an ADC1 channel (32-39); ADC2 is unusable while
 // WiFi is active. 34 is input-only, which suits a sensor input.
@@ -1274,6 +1287,25 @@ void loop()
     static float average[READ_TEMP_AVERAGE_COUNT];
     static bool  faulted[READ_TEMP_AVERAGE_COUNT];
     static uint8_t pointer =0;
+    static bool primed = false;
+
+    // Prime both filters from the first real reading rather than letting them
+    // fill from zero.
+    //
+    // Zero-filled, the rolling average reads a tenth of the true temperature
+    // on the first pass and climbs to it over a second, and the ramp ring
+    // reports that whole climb as a rate. The ramp is only cosmetic for that
+    // second -- the projection clamps it -- but the *temperature* is not: the
+    // 50 degC start interlock reads it, and a low reading opens the gate rather
+    // than closing it. The sequence that matters is a hot oven, a power cycle
+    // to clear a fault, the browser reconnecting, and Start pressed straight
+    // away; without this the oven would read cold and accept it.
+    if (!primed)
+    {
+      primed = true;
+      for (int i=0;i<READ_TEMP_AVERAGE_COUNT;i++) { average[i]=reading; faulted[i]=false; }
+      aktSystemTemperature = reading;
+    }
 
     average[pointer]=reading;
     faulted[pointer]=(reading > TEMP_PLAUSIBLE_MAX_C);
@@ -1300,6 +1332,13 @@ void loop()
 
     static float averagees[1000/READ_TEMP_INTERVAL_MS];
     static uint16_t p=0;
+    static bool rampPrimed = false;
+
+    if (!rampPrimed)
+    {
+      rampPrimed = true;
+      for (int i=0;i<1000/READ_TEMP_INTERVAL_MS;i++) averagees[i]=aktSystemTemperature;
+    }
 
     aktSystemTemperatureRamp = aktSystemTemperature - averagees[p];
 
