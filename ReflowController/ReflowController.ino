@@ -28,8 +28,15 @@
 
 //constance
 // Time-proportional relay output. A mechanical relay cannot be phase-fired, so
-// PID demand is expressed as on-time within a fixed window. The min on/off
+// heater demand is expressed as on-time within a fixed window. The min on/off
 // clamps suppress pulses too short to be worth a contact cycle.
+//
+// The controller quantises demand to POWER_LEVELS steps, so the shortest pulse
+// it can ask for is one level: 4000/4 = 1000ms, comfortably clear of the 500ms
+// minimum. Firing stays contiguous within the window -- the source project
+// spread it (X-X- rather than XX--), but the oven's thermal mass integrates
+// over minutes and cannot resolve the difference, while spreading would double
+// the contact closures per run.
 #define RELAY_WINDOW_MS   4000
 #define RELAY_TICK_MS       50
 #define RELAY_MIN_ON_MS    500
@@ -46,7 +53,8 @@
 // HARDWARE DEPENDENCY: this firmware assumes that divider is fitted. Without it
 // every reading comes out 1.5x high, which trips the TEMP_PLAUSIBLE_MAX_C fault
 // at 200degC real. That is the safe direction -- an over-reading sensor makes
-// the PID back off, never overheat -- but it will fault out rather than run, so
+// the controller back off, never overheat -- but it will fault out rather than
+// run, so
 // the symptom is a dead oven, not a damaged one.
 #define AD595_MV_PER_C        10.0f
 #define TEMP_DIVIDER_RATIO     1.5f
@@ -76,6 +84,117 @@
 #define MAX_PROFILES  30
 #define PROFILE_NAME_LENGTH 11
 
+// Rate-corridor control (see PORTING_ANALYSIS.md).
+//
+// A profile is a list of steps, each "reach targetTemp in between minDuration
+// and maxDuration seconds". That pair defines a corridor rather than a single
+// setpoint, and the controller nudges a discrete power level to keep both the
+// temperature and its rate of change inside it. There are no gains to tune:
+// the coarseness of a mechanical relay is the design premise rather than a
+// problem to work around.
+#define MAX_STEPS      8
+
+// Discrete power levels, 0..POWER_LEVELS-1, evenly spaced to 100%.
+#define POWER_LEVELS   5
+
+// How often the power level is re-evaluated. One relay window: nudging faster
+// than the actuator can express would slew the level across its whole range
+// before a single change reached the oven.
+#define CONTROL_INTERVAL_MS  RELAY_WINDOW_MS
+
+// Outside the corridor by more than this, the level moves by two rather than
+// one. Recovers from a badly-placed start without making normal tracking jumpy.
+#define CORRIDOR_HARD_C     10.0f
+
+// Thermal lag, seconds: how long the oven keeps rising after the element stops.
+//
+// The element is hotter than the air, so heat already in it lands in the oven
+// after the relay opens. Driving until the thermometer reads the target spends
+// all of that as overshoot -- at a ramp of 1 degC/s and this much lag, arriving
+// under power costs roughly this many degrees past target.
+//
+// The controller instead projects where it will end up if it stops now:
+//
+//     projected = temperature + rate * thermalLagSec
+//
+// and stops driving once that reaches the target, letting stored heat carry
+// the oven in rather than push it past.
+//
+// MEASURE THIS -- /measurelag does it for you, or derive it from a logged run
+// (tools/reflowlog.py). It is a property of the oven, its element and its load,
+// not of the profile, so it is stored alongside the profile rather than
+// compiled in. This is only the default for a device that has never measured.
+//
+// Too small and the oven overshoots; too large and it backs off early and
+// crawls the last few degrees. 20 s is a starting guess, not a measurement.
+#define THERMAL_LAG_DEFAULT_S  20.0f
+#define THERMAL_LAG_MIN_S       1.0f
+#define THERMAL_LAG_MAX_S     120.0f
+
+// Bound on the rate the projection is allowed to extrapolate, degC/s. No oven
+// ramps faster than this, so anything beyond it is a measurement artefact, not
+// a climb.
+//
+// This matters more than it looks. The projection now gates step advance, and
+// it multiplies the rate by the lag -- so a rate glitch is amplified
+// twentyfold into a temperature that sails past the target and advances the
+// step. ADC noise correlated with WiFi transmit activity is a known risk on
+// this hardware (see REWORK_NOTES.md 7.1), and at boot the ramp history is
+// zero-filled, which reads as a large false climb for the first second.
+// Bounding the rate costs nothing and turns both into a slow step rather than
+// a profile that races to Complete.
+#define PROJECTION_MAX_RATE_C_S  5.0f
+
+// Half-width of the band a dwell step holds, in degC. Dwell steps have no
+// corridor to sit inside -- start and target are the same -- so they regulate
+// against the projected temperature instead.
+#define DWELL_BAND_C         2.0f
+
+// --- /measurelag: the oven measures its own thermal lag -----------------------
+//
+// Heat at a fixed level to MEASURE_TEMP, cut the power, and watch how far the
+// temperature carries on rising:
+//
+//     lag = (peak - temp at cut) / rate at cut
+//
+// Drive level matters, because the coast comes out of the element and a hotter
+// element coasts longer. This sits at the level the corridor typically uses on
+// the approach to peak rather than at full power, so the number describes the
+// case it will be used in.
+#define MEASURE_LEVEL           3      // of POWER_LEVELS-1
+#define MEASURE_TEMP_DEFAULT_C  200    // measure near peak: see REWORK_NOTES 7.3
+#define MEASURE_TEMP_MIN_C      100
+// Lower than the profile step clamp (280) on purpose: the measurement is the
+// one cycle that *deliberately* overshoots its target, and the coast has to
+// fit under TEMP_PLAUSIBLE_MAX_C or the run ends in a sensor fault instead of
+// a number.
+#define MEASURE_TEMP_MAX_C      250
+// Give up if the oven never stops rising, or never gets going.
+#define MEASURE_COAST_TIMEOUT_S 180
+#define MEASURE_HEAT_TIMEOUT_S  900
+// The climb has to be real for the division to mean anything.
+#define MEASURE_MIN_RATE_C_S    0.05f
+
+// Abort if the oven runs this far above the corridor: a welded relay contact or
+// a shorted drive transistor looks like this, and nothing else does.
+#define CORRIDOR_ABORT_C   100.0f
+
+// A heating step that times out on maxDuration this far short of its target has
+// not merely run slow -- the element is not heating. The PID build had no such
+// check: its state machine advanced on the computed setpoint, so a dead element
+// ran the whole profile through to Complete without ever warming the oven.
+#define STEP_MISS_C         15.0f
+
+// Power ceiling during a cooling step, as a level index.
+//
+// The corridor law can hold heat to stop a descent running away, which is what
+// thermally shocks joints -- but cooling a small oven means opening the door,
+// and 0 here is the only thing keeping the element dead while a hand is in it.
+// The capability is built and unreachable on purpose. Raising this to 1 (25%)
+// enables controlled cooldown; do not do it until there is an interlock or a
+// deliberate decision that there does not need to be one.
+#define COOLDOWN_MAX_LEVEL  0
+
 // Name of both the setup access point and the mDNS host, so the oven is
 // reachable at http://REFLOW_HOSTNAME.local/ once it has joined a network.
 #define REFLOW_HOSTNAME "ReflowController"
@@ -96,21 +215,28 @@
 #include <driver/adc.h>
 #include <esp_adc_cal.h>
 
-#include "src/PID_v1/PID_v1.h"
-#include "src/PID_AutoTune_v0/PID_AutoTune_v0.h"
-
 #include "root_html.h"
 
 //structs
+// One profile segment: reach targetTemp no sooner than minDuration and no later
+// than maxDuration seconds after the step began. Those two bounds are the
+// corridor. This is how a solder paste datasheet states its profile ("ramp to
+// 150degC in 60-90s"), so a profile can be transcribed rather than converted.
+//
+// A step's corridor is rebased on the measured temperature when the step
+// begins, not on the previous step's target, so a warm oven or an overshoot
+// carries forward as a gentler rate rather than an impossible one.
+typedef struct step_s {
+  int16_t targetTemp;   // degC
+  int16_t minDuration;  // s, fastest acceptable -- reaching it sooner is "ahead"
+  int16_t maxDuration;  // s, slowest acceptable -- and the step's watchdog
+} Step_t;
+
 // data type for the values used in the reflow profile
 typedef struct profileValues_s {
   char    name[PROFILE_NAME_LENGTH];
-  int16_t soakTemp;
-  int16_t soakDuration;
-  int16_t peakTemp;
-  int16_t peakDuration;
-  float  rampUpRate;
-  float  rampDownRate;
+  uint8_t stepCount;
+  Step_t  steps[MAX_STEPS];
 } Profile_t;
 
 typedef enum {
@@ -122,16 +248,15 @@ typedef enum {
   // several checks are written as comparisons against it.
   ProcessStart = 9,
 
-  RampToSoak = 10,
-  Soak,
-  RampUp,
-  Peak,
-  CoolDown,
+  // The five fixed phases are gone: a profile is now an arbitrary list of steps,
+  // so the phase is a step index and there is one running state.
+  Running = 10,
 
   Complete = 20,
 
-  PreTune = 30,
-  Tune,
+  // Self-measurement of the thermal lag. Above ProcessStart, so it counts as an
+  // active cycle and the same mutation lockout applies.
+  MeasureLag = 30,
 } State;
 
 
@@ -162,12 +287,6 @@ volatile uint8_t  powerHeater=0;
 float aktSystemTemperature;
 float aktSystemTemperatureRamp; //°C/s
 
-int16_t tuningHeaterOutput=30;
-int16_t tuningNoiseBand=1;
-int16_t tuningOutputStep=10;
-int16_t tuningLookbackSec=60;
-
-
 int activeProfileId = 0;
 Profile_t activeProfile; // the one and only instance
 
@@ -177,21 +296,23 @@ uint64_t stateChangedTicks = 0;
 // Manual heating power, 0..100%, set from the web UI.
 uint8_t manualPower = 0;
 
+// Corridor state for the step being run. heaterSetpoint is the middle of the
+// corridor -- it no longer drives anything, but /status still reports it and
+// the web chart still plots it, and the corridor centre is what that trace
+// meant all along.
+// Thermal lag in seconds, measured or entered, persisted in Preferences.
+float thermalLagSec = THERMAL_LAG_DEFAULT_S;
+// Temperature /measurelag heats to before cutting the power.
+int16_t measureTempC = MEASURE_TEMP_DEFAULT_C;
+// Result of the last measurement, 0 if none this power-up.
+float measuredLagSec = 0.0f;
+
 float heaterSetpoint;
-float heaterInput;
-float heaterOutput;
-
-typedef struct {
-  float Kp;
-  float Ki;
-  float Kd;
-} PID_t;
-
-PID_t heaterPID;
-
-PID PID(&heaterInput, &heaterOutput, &heaterSetpoint, heaterPID.Kp, heaterPID.Ki, heaterPID.Kd, DIRECT);
-
-PID_ATune PIDTune(&heaterInput, &heaterOutput);
+float corridorLow;      // degC, coolest the oven may be right now
+float corridorHigh;     // degC, hottest it may be
+uint8_t activeStep = 0; // index into activeProfile.steps
+float stepStartTemp;    // measured temperature when the step began
+uint8_t powerLevel = 0; // 0..POWER_LEVELS-1, what the corridor law is asking for
 
 uint64_t cycleStartTime=0;
 
@@ -307,15 +428,10 @@ const char * currentStateToString()
 {
   #define casePrintState(state) case state: return #state;
   switch (currentState) {
-    casePrintState(RampToSoak);
-    casePrintState(Soak);
-    casePrintState(RampUp);
-    casePrintState(Peak);
-    casePrintState(CoolDown);
+    casePrintState(Running);
     casePrintState(Complete);
-    casePrintState(PreTune);
-    casePrintState(Tune);
     casePrintState(Manual);
+    casePrintState(MeasureLag);
     default: return "Ready";
   }
 }
@@ -335,19 +451,30 @@ void loadProfile(unsigned int targetProfile) {
   saveLastUsedProfile();
 }
 
+// The lead-free profile decoded from the source project (PORTING_ANALYSIS.md
+// section 6), which was run against this oven, relay and probe. These durations
+// are measured behaviour of this specific oven, not a datasheet ideal, so they
+// are the right thing to start from -- and the reason the corridor law arrives
+// already tuned.
+//
+// Steps 3-5 are the controlled cooldown. They are stored and run, but
+// COOLDOWN_MAX_LEVEL holds their power at zero, so today they act as timed
+// coast-down segments.
 void makeDefaultProfile() {
-  snprintf(activeProfile.name,PROFILE_NAME_LENGTH,"%s","Default");
-  activeProfile.soakTemp     = 130;
-  activeProfile.soakDuration =  80;
-  activeProfile.peakTemp     = 220;
-  activeProfile.peakDuration =  40;
-  activeProfile.rampUpRate   =   0.80;
-  activeProfile.rampDownRate =   2.0;
-}
-void makeDefaultPID() {
-  heaterPID.Kp =  0.60; 
-  heaterPID.Ki =  0.01;
-  heaterPID.Kd = 19.70;
+  snprintf(activeProfile.name,PROFILE_NAME_LENGTH,"%s","LeadFree");
+  static const Step_t defaultSteps[] = {
+    { 170, 138, 180 },
+    { 220,  31,  64 },
+    { 243,  21,  28 },
+    { 220,  21,  28 },
+    { 150,  30,  45 },
+    {  30,  20,  30 },
+  };
+  activeProfile.stepCount = sizeof(defaultSteps)/sizeof(defaultSteps[0]);
+  memcpy(activeProfile.steps, defaultSteps, sizeof(defaultSteps));
+  for (uint8_t i = activeProfile.stepCount; i < MAX_STEPS; i++) {
+    activeProfile.steps[i] = (Step_t){0,0,0};
+  }
 }
 
 void getProfileKey(uint8_t profile, char * buffer){
@@ -379,6 +506,15 @@ bool loadParameters(uint8_t profile) {
   else
   {
     PREF.getBytes(buffer, (uint8_t*)&activeProfile, length);
+
+    // stepCount indexes steps[] in the control loop, and it came off flash.
+    // A size match is not a validity guarantee -- a struct change that happened
+    // to keep the same size would read as garbage -- so bound it here rather
+    // than trusting it at the point where it is used to subscript.
+    if (activeProfile.stepCount < 1 || activeProfile.stepCount > MAX_STEPS) {
+      Serial.println("PROFILE step count implausible, loading default");
+      makeDefaultProfile();
+    }
   }  
 
   return true;
@@ -402,24 +538,39 @@ void loadProfileName(uint8_t id, char * buffer){
   }  
 }
 
-bool savePID() {
-  PREF.putBytes("PID", (uint8_t*)&heaterPID, sizeof(heaterPID));  
+// The lag and the measure temperature are oven properties rather than profile
+// properties, so they live in their own key and survive a profile change.
+typedef struct {
+  float   thermalLagSec;
+  int16_t measureTempC;
+} Oven_t;
+
+bool saveOven() {
+  Oven_t o = { thermalLagSec, measureTempC };
+  PREF.putBytes("OVEN", (uint8_t*)&o, sizeof(o));
   return true;
 }
 
-bool loadPID() {
-  
-  size_t length = PREF.getBytesLength("PID");
-  
-  if(length!=sizeof(heaterPID)){
-    makeDefaultPID();
-    Serial.println("load default PID");
+bool loadOven() {
+  Oven_t o;
+  if (PREF.getBytesLength("OVEN") != sizeof(o)) {
+    Serial.println("load default OVEN");
+    thermalLagSec = THERMAL_LAG_DEFAULT_S;
+    measureTempC  = MEASURE_TEMP_DEFAULT_C;
+    return true;
   }
-  else
-  {
-    PREF.getBytes("PID", (uint8_t*)&heaterPID, length);
-  }  
-  return true;  
+  PREF.getBytes("OVEN", (uint8_t*)&o, sizeof(o));
+
+  // Both are read back off flash and both feed the control loop -- the lag
+  // multiplies the rate term in the projection, so a garbage value here is a
+  // profile that races to Complete. Bound them rather than trust them.
+  thermalLagSec = (o.thermalLagSec >= THERMAL_LAG_MIN_S &&
+                   o.thermalLagSec <= THERMAL_LAG_MAX_S)
+                  ? o.thermalLagSec : THERMAL_LAG_DEFAULT_S;
+  measureTempC  = (o.measureTempC >= MEASURE_TEMP_MIN_C &&
+                   o.measureTempC <= MEASURE_TEMP_MAX_C)
+                  ? o.measureTempC : MEASURE_TEMP_DEFAULT_C;
+  return true;
 }
 
 
@@ -434,6 +585,9 @@ void factoryReset() {
 
   activeProfileId = 0;
   makeDefaultProfile();
+  thermalLagSec = THERMAL_LAG_DEFAULT_S;
+  measureTempC  = MEASURE_TEMP_DEFAULT_C;
+  measuredLagSec = 0.0f;
 }
 
 void saveLastUsedProfile() {
@@ -443,26 +597,6 @@ void saveLastUsedProfile() {
 void loadLastUsedProfile() {
   activeProfileId = PREF.getUChar("ProfileID", 0);
   loadParameters(activeProfileId);
-}
-
-// Applies a query argument only if the request actually carried it, so a form
-// can submit one field without blanking the rest.
-static bool argInt16(WebServer &srv, const char *name, int16_t *out, int16_t lo, int16_t hi) {
-  if (!srv.hasArg(name)) return false;
-  long v = srv.arg(name).toInt();
-  if (v < lo) v = lo;
-  if (v > hi) v = hi;
-  *out = (int16_t)v;
-  return true;
-}
-
-static bool argFloat(WebServer &srv, const char *name, float *out, float lo, float hi) {
-  if (!srv.hasArg(name)) return false;
-  float v = srv.arg(name).toFloat();
-  if (v < lo) v = lo;
-  if (v > hi) v = hi;
-  *out = v;
-  return true;
 }
 
 // Escapes the few characters that would otherwise break out of a JSON string.
@@ -509,7 +643,7 @@ void setup() {
   //Preferences init
   PREF.begin("REFLOW");
   loadLastUsedProfile();
-  loadPID();
+  loadOven();
   
   //init Wifi:
   // Provisioning used to be an encoder-driven network scan with an on-screen
@@ -546,9 +680,16 @@ void setup() {
   });
   server.on("/status", []() {
     server.sendHeader("Cache-Control","no-cache");
-    char buffer[320];
+    char buffer[384];
     unsigned long time = (esp_timer_get_time()-cycleStartTime)/1000;
-    snprintf(buffer,320,"{\"time\": %lu, \"temp\": %.2f, \"dt\": %.2f, \"setpoint\":  %.2f, \"power\": %.2f, \"state\": \"%s\", \"fault\": \"%s\"}",time,aktSystemTemperature,aktSystemTemperatureRamp,heaterSetpoint,heaterOutput*100/256,currentStateToString(),globalErrorText);
+    snprintf(buffer,sizeof(buffer),
+      "{\"time\": %lu, \"temp\": %.2f, \"dt\": %.2f, \"setpoint\": %.2f,"
+      " \"low\": %.2f, \"high\": %.2f, \"power\": %.2f, \"step\": %d,"
+      " \"steps\": %d, \"lag\": %.1f, \"state\": \"%s\", \"fault\": \"%s\"}",
+      time, aktSystemTemperature, aktSystemTemperatureRamp, heaterSetpoint,
+      corridorLow, corridorHigh,
+      (float)powerHeater*100.0f/255.0f, activeStep, activeProfile.stepCount,
+      thermalLagSec, currentStateToString(), globalErrorText);
     server.send(200, "application/json", buffer);
   });
   // Slot directory for the profile picker: every slot, named or free.
@@ -565,21 +706,24 @@ void setup() {
     server.send(200, "application/json", out);
   });
   // Everything the menu used to let you edit, in one document.
+  // Everything the menu used to let you edit, in one document. The PID gains
+  // and autotune parameters that used to live here are gone with the PID.
   server.on("/config", []() {
     server.sendHeader("Cache-Control","no-cache");
-    char buffer[512];
-    snprintf(buffer, sizeof(buffer),
-      "{\"profile\": {\"id\": %d, \"name\": \"%s\", \"soakTemp\": %d, \"soakDuration\": %d,"
-      " \"peakTemp\": %d, \"peakDuration\": %d, \"rampUpRate\": %.2f, \"rampDownRate\": %.2f},"
-      " \"pid\": {\"kp\": %.2f, \"ki\": %.2f, \"kd\": %.2f},"
-      " \"tuning\": {\"output\": %d, \"noiseBand\": %d, \"step\": %d, \"lookback\": %d}}",
-      activeProfileId, jsonEscape(activeProfile.name).c_str(),
-      activeProfile.soakTemp, activeProfile.soakDuration,
-      activeProfile.peakTemp, activeProfile.peakDuration,
-      activeProfile.rampUpRate, activeProfile.rampDownRate,
-      heaterPID.Kp, heaterPID.Ki, heaterPID.Kd,
-      tuningHeaterOutput, tuningNoiseBand, tuningOutputStep, tuningLookbackSec);
-    server.send(200, "application/json", buffer);
+    String out = "{\"profile\": {\"id\": " + String(activeProfileId) +
+                 ", \"name\": \"" + jsonEscape(activeProfile.name) +
+                 "\", \"steps\": [";
+    for (uint8_t i = 0; i < activeProfile.stepCount; i++) {
+      if (i) out += ",";
+      out += "{\"targetTemp\": "  + String(activeProfile.steps[i].targetTemp) +
+             ", \"minDuration\": " + String(activeProfile.steps[i].minDuration) +
+             ", \"maxDuration\": " + String(activeProfile.steps[i].maxDuration) + "}";
+    }
+    out += "]}, \"maxSteps\": " + String(MAX_STEPS) +
+           ", \"oven\": {\"thermalLag\": " + String(thermalLagSec, 1) +
+           ", \"measureTemp\": " + String(measureTempC) +
+           ", \"measuredLag\": " + String(measuredLagSec, 1) + "}}";
+    server.send(200, "application/json", out);
   });
   serverAction.on("/start", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
@@ -588,7 +732,7 @@ void setup() {
     {
       //Start Reflow!
       cycleStartTime = esp_timer_get_time();
-      currentState = RampToSoak;
+      currentState = Running;
       serverAction.send(200, "text/plain", "OK");
     }
     else
@@ -599,20 +743,19 @@ void setup() {
   serverAction.on("/stop", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
     serverAction.sendHeader("Access-Control-Allow-Origin","*");
+    // The old firmware had a CoolDown phase to hand off to, so a first /stop
+    // aborted into it and a second acknowledged completion. Cooling is now just
+    // the profile's trailing steps, so there is nothing to hand off to: stop
+    // means stop, with the heater off either way.
     bool ok=false;
-    if (currentState == Complete) 
-    { 
+    if (currentState == Complete)
+    {
       currentState = Ready;
       ok=true;
     }
-    else if (currentState == CoolDown) 
+    else if (currentState > ProcessStart)
     {
       currentState = Complete;
-      ok=true;
-    }
-    else if (currentState > ProcessStart) 
-    {
-      currentState = CoolDown;
       ok=true;
     }
     if(ok){
@@ -624,22 +767,8 @@ void setup() {
     }
   });
   // These replace menu items that the display rework removed. Without them
-  // autotune, manual heating, profile switching and factory reset would have no
-  // trigger at all. Richer profile editing follows on the main server.
-  serverAction.on("/tune", []() {
-    serverAction.sendHeader("Cache-Control","no-cache");
-    serverAction.sendHeader("Access-Control-Allow-Origin","*");
-    if(currentState == Ready && !globalError)
-    {
-      cycleStartTime = esp_timer_get_time();
-      currentState = PreTune; // preheat until stable, then hand off to Tune
-      serverAction.send(200, "text/plain", "OK");
-    }
-    else
-    {
-      serverAction.send(409, "text/plain", "ERROR");
-    }
-  });
+  // manual heating, profile switching and factory reset would have no trigger
+  // at all. Richer profile editing follows on the main server.
   serverAction.on("/manual", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
     serverAction.sendHeader("Access-Control-Allow-Origin","*");
@@ -679,6 +808,50 @@ void setup() {
     saveProfile(id);
     serverAction.send(200, "text/plain", "OK");
   });
+  // Sets the oven's own parameters, as opposed to a profile's. Persisted
+  // immediately: unlike /profile/edit there is no slot to save them into.
+  serverAction.on("/oven", []() {
+    serverAction.sendHeader("Cache-Control","no-cache");
+    serverAction.sendHeader("Access-Control-Allow-Origin","*");
+    if(currentState != Ready)
+    {
+      serverAction.send(409, "text/plain", "ERROR");
+      return;
+    }
+    if(serverAction.hasArg("thermalLag"))
+    {
+      float v = serverAction.arg("thermalLag").toFloat();
+      if (v < THERMAL_LAG_MIN_S) v = THERMAL_LAG_MIN_S;
+      if (v > THERMAL_LAG_MAX_S) v = THERMAL_LAG_MAX_S;
+      thermalLagSec = v;
+    }
+    if(serverAction.hasArg("measureTemp"))
+    {
+      long v = serverAction.arg("measureTemp").toInt();
+      if (v < MEASURE_TEMP_MIN_C) v = MEASURE_TEMP_MIN_C;
+      if (v > MEASURE_TEMP_MAX_C) v = MEASURE_TEMP_MAX_C;
+      measureTempC = (int16_t)v;
+    }
+    saveOven();
+    serverAction.send(200, "text/plain", "OK");
+  });
+  // Runs the lag measurement cycle. This heats the oven to measureTemp and
+  // then deliberately lets it overshoot, so it is a real oven cycle with the
+  // same lockout as a profile run.
+  serverAction.on("/measurelag", []() {
+    serverAction.sendHeader("Cache-Control","no-cache");
+    serverAction.sendHeader("Access-Control-Allow-Origin","*");
+    if(currentState == Ready && !globalError)
+    {
+      cycleStartTime = esp_timer_get_time();
+      currentState = MeasureLag;
+      serverAction.send(200, "text/plain", "OK");
+    }
+    else
+    {
+      serverAction.send(409, "text/plain", "ERROR");
+    }
+  });
   serverAction.on("/factoryreset", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
     serverAction.sendHeader("Access-Control-Allow-Origin","*");
@@ -692,6 +865,11 @@ void setup() {
   });
   // Edits the in-memory profile. Not persisted until /profile/save, matching
   // how the menu behaved: edit freely, then choose a slot to write to.
+  //
+  // Steps arrive as one "target,min,max" triple per step, semicolon separated:
+  //   steps=170,138,180;220,31,64;243,21,28
+  // The whole list is replaced or none of it is -- a half-applied profile would
+  // be a corridor that no longer joins up.
   serverAction.on("/profile/edit", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
     serverAction.sendHeader("Access-Control-Allow-Origin","*");
@@ -704,42 +882,62 @@ void setup() {
     {
       snprintf(activeProfile.name, PROFILE_NAME_LENGTH, "%s", serverAction.arg("name").c_str());
     }
-    argInt16(serverAction, "soakTemp",     &activeProfile.soakTemp,     0, 280);
-    argInt16(serverAction, "soakDuration", &activeProfile.soakDuration, 0, 999);
-    // Kept below TEMP_PLAUSIBLE_MAX_C: a profile must not be able to ask for a
-    // temperature that would trip the sensor fault on the way to reaching it.
-    argInt16(serverAction, "peakTemp",     &activeProfile.peakTemp,     0, 280);
-    argInt16(serverAction, "peakDuration", &activeProfile.peakDuration, 0, 999);
-    argFloat(serverAction, "rampUpRate",   &activeProfile.rampUpRate,   0.1f, 10.0f);
-    argFloat(serverAction, "rampDownRate", &activeProfile.rampDownRate, 0.1f, 10.0f);
-    serverAction.send(200, "text/plain", "OK");
-  });
-  serverAction.on("/pid", []() {
-    serverAction.sendHeader("Cache-Control","no-cache");
-    serverAction.sendHeader("Access-Control-Allow-Origin","*");
-    if(currentState != Ready)
+    if(serverAction.hasArg("steps"))
     {
-      serverAction.send(409, "text/plain", "ERROR");
-      return;
+      Step_t parsed[MAX_STEPS];
+      uint8_t count = 0;
+      String in = serverAction.arg("steps");
+      int pos = 0;
+
+      while (pos < (int)in.length() && count < MAX_STEPS)
+      {
+        int end = in.indexOf(';', pos);
+        if (end < 0) end = in.length();
+        String field = in.substring(pos, end);
+        pos = end + 1;
+
+        field.trim();
+        if (field.length() == 0) continue;
+
+        int c1 = field.indexOf(',');
+        int c2 = (c1 < 0) ? -1 : field.indexOf(',', c1 + 1);
+        if (c1 < 0 || c2 < 0)
+        {
+          serverAction.send(400, "text/plain", "ERROR");
+          return;
+        }
+
+        long target = field.substring(0, c1).toInt();
+        long lo     = field.substring(c1 + 1, c2).toInt();
+        long hi     = field.substring(c2 + 1).toInt();
+
+        // Held below TEMP_PLAUSIBLE_MAX_C: a profile must not be able to ask
+        // for a temperature that would trip the sensor fault on the way to
+        // reaching it.
+        if (target <   0) target =   0;
+        if (target > 280) target = 280;
+        if (lo <   1) lo =   1;
+        if (lo > 999) lo = 999;
+        if (hi <  lo) hi =  lo;   // an inverted corridor has no inside
+        if (hi > 999) hi = 999;
+
+        parsed[count].targetTemp  = (int16_t)target;
+        parsed[count].minDuration = (int16_t)lo;
+        parsed[count].maxDuration = (int16_t)hi;
+        count++;
+      }
+
+      if (count == 0)
+      {
+        serverAction.send(400, "text/plain", "ERROR");
+        return;
+      }
+
+      activeProfile.stepCount = count;
+      for (uint8_t i = 0; i < MAX_STEPS; i++) {
+        activeProfile.steps[i] = (i < count) ? parsed[i] : (Step_t){0,0,0};
+      }
     }
-    argFloat(serverAction, "kp", &heaterPID.Kp, 0.0f, 1000.0f);
-    argFloat(serverAction, "ki", &heaterPID.Ki, 0.0f, 1000.0f);
-    argFloat(serverAction, "kd", &heaterPID.Kd, 0.0f, 1000.0f);
-    savePID();
-    serverAction.send(200, "text/plain", "OK");
-  });
-  serverAction.on("/tuning", []() {
-    serverAction.sendHeader("Cache-Control","no-cache");
-    serverAction.sendHeader("Access-Control-Allow-Origin","*");
-    if(currentState != Ready)
-    {
-      serverAction.send(409, "text/plain", "ERROR");
-      return;
-    }
-    argInt16(serverAction, "output",    &tuningHeaterOutput, 1, 100);
-    argInt16(serverAction, "noiseBand", &tuningNoiseBand,    1, 50);
-    argInt16(serverAction, "step",      &tuningOutputStep,   1, 100);
-    argInt16(serverAction, "lookback",  &tuningLookbackSec,  1, 600);
     serverAction.send(200, "text/plain", "OK");
   });
   server.onNotFound([](){
@@ -869,166 +1067,323 @@ void loop()
     lastControlloopupdate+=100; 
 
     static State previousState= None; // sentinel: never equals a real state
-    static uint64_t stateChangedTime_ms=time_ms;
     boolean stateChanged=false;
-    if (currentState != previousState) 
+    if (currentState != previousState)
     {
-      stateChangedTime_ms=time_ms;
       stateChanged = true;
       previousState = currentState;
     }
-    static float rampToSoakStartTemp;
-    static float coolDownStartTemp;
-    
-    heaterInput = aktSystemTemperature; 
+    static uint64_t stepStartedTime_ms = time_ms;
+    static uint64_t lastLevelUpdate_ms  = time_ms;
+    static bool     cooldownAnnounced   = false;
 
-    switch (currentState) 
+    if (currentState == Running)
     {
-      case RampToSoak:
-        if (stateChanged) 
-        {
-
-          rampToSoakStartTemp=aktSystemTemperature;
-          heaterSetpoint = rampToSoakStartTemp;
-
-          PID.SetMode(AUTOMATIC);
-          PID.SetControllerDirection(DIRECT);
-          PID.SetTunings(heaterPID.Kp, heaterPID.Ki, heaterPID.Kd);
-        }
-
-        heaterSetpoint = rampToSoakStartTemp + (activeProfile.rampUpRate * (time_ms-stateChangedTime_ms)/1000.0);
-
-        if (heaterSetpoint >= activeProfile.soakTemp) 
-        {
-          currentState = Soak;
-        }
-        break;
-
-      case Soak:
-
-        heaterSetpoint = activeProfile.soakTemp;
-
-        if (time_ms - stateChangedTime_ms >= (uint32_t)activeProfile.soakDuration * 1000) 
-        {
-          currentState = RampUp;
-        }
-        break;
-
-      case RampUp:
-
-        heaterSetpoint = activeProfile.soakTemp + (activeProfile.rampUpRate * (time_ms-stateChangedTime_ms)/1000.0);
-
-        if (heaterSetpoint >= activeProfile.peakTemp) 
-        {
-          currentState = Peak;
-        }
-        break;
-
-      case Peak:
-
-        heaterSetpoint = activeProfile.peakTemp;
-
-        if (time_ms - stateChangedTime_ms >= (uint32_t)activeProfile.peakDuration * 1000) {
-          currentState = CoolDown;
-        }
-        break;
-
-      case CoolDown:
-        if (stateChanged) {
-          PID.SetMode(MANUAL);
-
-          beepcount=3;  //Beep! We need the door open!!!
-
-          //rampDown from the last setpoint
-          coolDownStartTemp=heaterSetpoint;
-        }
-
-        heaterSetpoint = coolDownStartTemp - (activeProfile.rampDownRate * (time_ms - stateChangedTime_ms) / 1000.0);
-        heaterOutput = 0;
-
-        if (heaterSetpoint < IDLE_TEMP) {
-            heaterSetpoint = IDLE_TEMP;
-        }
-        
-        if (aktSystemTemperature < IDLE_TEMP && heaterSetpoint == IDLE_TEMP) {
-          currentState = Complete;
-          PID.SetMode(MANUAL);
-
-          beepcount=1;  //Beep! We are done!!!
-
-        }
-        break;
-      case PreTune:
-        if(stateChanged)
-        {
-        	PID.SetMode(MANUAL);
-        	heaterSetpoint = aktSystemTemperature;
-            heaterOutput = 255*tuningHeaterOutput/100;
-        }
-        if(heaterSetpoint+tuningNoiseBand <aktSystemTemperature || heaterSetpoint-tuningNoiseBand >aktSystemTemperature ) {
-          stateChangedTime_ms=time_ms;
-          heaterSetpoint = aktSystemTemperature;
-        }
-        if (time_ms - stateChangedTime_ms >= tuningLookbackSec*2 * 1000) {
-          currentState = Tune;
-        }
-        break;
-      case Tune:
-        if (stateChanged) 
-        {
-          heaterSetpoint = aktSystemTemperature;
-          
-          PIDTune.Cancel();
-          heaterOutput = 255*tuningHeaterOutput/100;
-          PIDTune.SetNoiseBand(tuningNoiseBand);
-          PIDTune.SetOutputStep(255*tuningOutputStep/100);
-          PIDTune.SetLookbackSec(tuningLookbackSec);
-          PIDTune.SetControlType(CT_PID_NO_OVERSHOOT); //We want NO Overshoot :-)
-        }
-
-        int8_t val = PIDTune.Runtime();
-
-        if (val != 0) 
-        {
-          currentState = CoolDown;
-          heaterPID.Kp = PIDTune.GetKp();
-          heaterPID.Ki = PIDTune.GetKi();
-          heaterPID.Kd = PIDTune.GetKd();
-
-          savePID();
-
-          Serial.printf("Autotune done: Kp=%.2f Ki=%.2f Kd=%.2f\n",
-                        heaterPID.Kp, heaterPID.Ki, heaterPID.Kd);
-        }
-
-        break;
-    }
-
-    PID.Compute();
-
-    if (
-         currentState == RampToSoak ||
-         currentState == Soak ||
-         currentState == RampUp ||
-         currentState == Peak ||
-         currentState == PreTune ||
-         currentState == Tune          
-       )
-    {
-  
-      if (heaterSetpoint+100 < aktSystemTemperature) // if we're 100 degree cooler than setpoint, abort
+      if (stateChanged)
       {
-        reportError("Temperature is Way to HOT!!!!!"); 
+        activeStep         = 0;
+        stepStartTemp      = aktSystemTemperature;
+        stepStartedTime_ms = time_ms;
+        lastLevelUpdate_ms = time_ms;
+        powerLevel         = 0;
+        cooldownAnnounced  = false;
       }
-      powerHeater = (uint8_t)heaterOutput;
-    } 
+
+      const Step_t &step = activeProfile.steps[activeStep];
+
+      // Signed size of the step. dir is +1 for a heating step and -1 for a
+      // cooling one, and is the only place the two differ: everything below is
+      // computed as a fraction of delta, which normalises the sign away.
+      float delta = (float)step.targetTemp - stepStartTemp;
+      float dir   = (delta >= 0.0f) ? 1.0f : -1.0f;
+
+      float elapsed_s = (time_ms - stepStartedTime_ms) / 1000.0f;
+
+      // Where the corridor says the oven should be by now, as a fraction of the
+      // step. Reaching the target sooner than minDuration is "ahead", later
+      // than maxDuration is "behind".
+      float aheadFrac  = (step.minDuration > 0) ? elapsed_s / step.minDuration : 1.0f;
+      float behindFrac = (step.maxDuration > 0) ? elapsed_s / step.maxDuration : 1.0f;
+      if (aheadFrac  > 1.0f) aheadFrac  = 1.0f;
+      if (behindFrac > 1.0f) behindFrac = 1.0f;
+
+      float aheadTemp  = stepStartTemp + delta * aheadFrac;
+      float behindTemp = stepStartTemp + delta * behindFrac;
+
+      corridorLow    = (aheadTemp < behindTemp) ? aheadTemp : behindTemp;
+      corridorHigh   = (aheadTemp < behindTemp) ? behindTemp : aheadTemp;
+      heaterSetpoint = (corridorLow + corridorHigh) / 2.0f;
+
+      // A step with no temperature change (a dwell) has no corridor to be
+      // inside; it regulates on the projection instead, below.
+      bool isDwell = (fabsf(delta) < 0.5f);
+
+      // Where the oven ends up if the relay opens now. This is what the
+      // controller steers, not the present temperature: with a mechanical
+      // relay and an element hotter than the air, by the time the thermometer
+      // reads the target the heat that overshoots it has already been
+      // delivered. See thermalLagSec and THERMAL_LAG_DEFAULT_S.
+      float projectionRate = aktSystemTemperatureRamp;
+      if (projectionRate >  PROJECTION_MAX_RATE_C_S) projectionRate =  PROJECTION_MAX_RATE_C_S;
+      if (projectionRate < -PROJECTION_MAX_RATE_C_S) projectionRate = -PROJECTION_MAX_RATE_C_S;
+      float projectedTemp = aktSystemTemperature + projectionRate * thermalLagSec;
+
+      // Re-evaluate once per relay window. The level is what the actuator can
+      // actually express, so moving it faster than the window would just slew
+      // it across the whole range before one change reached the oven.
+      if (time_ms - lastLevelUpdate_ms >= CONTROL_INTERVAL_MS)
+      {
+        lastLevelUpdate_ms = time_ms;
+
+        int8_t nudge = 0; // in corridor terms: +1 means "make more progress"
+
+        if (isDwell)
+        {
+          // Hold the target against the projection. Without this a dwell step
+          // simply froze the level wherever the previous step left it and let
+          // the durations run out, which is no regulation at all.
+          if (projectedTemp > step.targetTemp + DWELL_BAND_C)      nudge = -1;
+          else if (projectedTemp < step.targetTemp - DWELL_BAND_C) nudge =  1;
+        }
+        else
+        {
+          float progress = (aktSystemTemperature - stepStartTemp) / delta;
+
+          if (progress < behindFrac)
+          {
+            // Behind the corridor. Two levels if badly behind, so a cold start
+            // or a late step recovers instead of creeping.
+            nudge = (dir * (behindTemp - aktSystemTemperature) > CORRIDOR_HARD_C) ? 2 : 1;
+          }
+          else if (progress > aheadFrac)
+          {
+            nudge = (dir * (aktSystemTemperature - aheadTemp) > CORRIDOR_HARD_C) ? -2 : -1;
+          }
+          else
+          {
+            // Inside the corridor: hold position, but keep the rate in band so
+            // the oven arrives at the far end still under control rather than
+            // drifting to one wall and riding it.
+            //
+            // aktSystemTemperatureRamp is a 1s difference of the 1s rolling
+            // average, in degC/s and in float. The source project computed its
+            // rate term in integer arithmetic that truncated to 1 degC/s against
+            // profile rates of 0.72-1.61 -- barely one bit -- so this term
+            // actually contributes here in a way it never did there.
+            float normRate = aktSystemTemperatureRamp / delta; // fraction of step per second
+            if (step.maxDuration > 0 && normRate < 1.0f / step.maxDuration) nudge = 1;
+            else if (step.minDuration > 0 && normRate > 1.0f / step.minDuration) nudge = -1;
+          }
+        }
+
+        // Corridor terms into power terms. On a cooling step making more
+        // progress means less heat, which is exactly what dir flips.
+        int16_t next = (int16_t)powerLevel + (int16_t)(dir * nudge);
+        if (next < 0) next = 0;
+        if (next > POWER_LEVELS - 1) next = POWER_LEVELS - 1;
+
+        // Arrival is assured: stop driving and coast in.
+        //
+        // This overrides the corridor, deliberately. The corridor can still be
+        // asking for heat -- being behind on time is exactly when it does --
+        // but if the heat already in the element is enough to reach the target,
+        // any more of it is overshoot. Reaching the target late is a profile
+        // that ran slow; reaching it 20 degC hot is a reflow that cooked the
+        // board, so the corridor loses this argument.
+        //
+        // The step advance below tests the same projection, so most of the time
+        // the step simply ends here. What this clamp catches is the case the
+        // advance cannot: a step that projects to arrive *before* minDuration
+        // has elapsed. The advance is blocked by minMet, the oven is running
+        // hot and early, and without this it would keep driving into the wait.
+        //
+        // It is a clamp and not a latch: if the climb decays and the
+        // projection falls back below the target, the corridor gets its
+        // authority back on the next window and drives again.
+        if (!isDwell && dir > 0.0f && projectedTemp >= step.targetTemp)
+        {
+          next = 0;
+        }
+
+        // Cooling steps are capped, and by default that cap is zero. See
+        // COOLDOWN_MAX_LEVEL: the descent is a coast, not a controlled one,
+        // until someone decides the door interlock question.
+        if (delta < 0.0f && next > COOLDOWN_MAX_LEVEL) next = COOLDOWN_MAX_LEVEL;
+
+        powerLevel = (uint8_t)next;
+      }
+
+      // The level will often alternate between two neighbours rather than
+      // settling -- the oven usually wants something between 50% and 75%, and
+      // POWER_LEVELS cannot express it. That is dithering, not instability:
+      // alternating each window averages to the level in between, so the
+      // quantisation loses less resolution than its step size suggests, and
+      // the oven's thermal mass integrates the ripple away. Do not "fix" it
+      // with hysteresis; that would throw the recovered resolution away.
+
+      // Step advance: arrival has to be *guaranteed*, with maxDuration as the
+      // watchdog.
+      //
+      // The PID build advanced when its *computed setpoint* reached the target
+      // and never consulted the thermometer, so an oven that could not keep up
+      // was abandoned mid-ramp while the state machine marched on.
+      //
+      // Guaranteed, not achieved: a heating step ends once the heat already in
+      // the element is enough to carry the oven to the target, because that is
+      // the moment there is nothing left to drive. Waiting for the thermometer
+      // to actually read the target would mean holding the relay closed
+      // through the entire coast and arriving hot -- and the step would sit
+      // there driving a target it had already committed to overshooting.
+      //
+      // Cooling steps stay on the measured temperature. The projection exists
+      // to stop the *actuator* overshooting, and nothing drives a descent.
+      bool reached  = isDwell ||
+                      (dir > 0.0f ? (projectedTemp >= step.targetTemp)
+                                  : (aktSystemTemperature <= step.targetTemp));
+      bool minMet   = elapsed_s >= step.minDuration;
+      bool timedOut = elapsed_s >= step.maxDuration;
+
+      if ((minMet && reached) || timedOut)
+      {
+        // Timed out a long way short on a heating step: this is not a slow
+        // oven, it is an element that is not heating. Nothing else looks like
+        // this, and without the check a dead element runs the whole profile
+        // through to Complete having never warmed anything.
+        if (timedOut && !reached && dir > 0.0f &&
+            (step.targetTemp - aktSystemTemperature) > STEP_MISS_C)
+        {
+          reportError("Oven not heating: step timed out short of target");
+        }
+
+        activeStep++;
+        if (activeStep >= activeProfile.stepCount)
+        {
+          currentState = Complete;
+          powerLevel   = 0;
+          beepcount    = 1; // Beep! We are done!!!
+        }
+        else
+        {
+          stepStartTemp      = aktSystemTemperature;
+          stepStartedTime_ms = time_ms;
+          lastLevelUpdate_ms = time_ms;
+
+          // First cooling step: the oven cannot cool itself, so ask for the
+          // door. The old firmware beeped on entering CoolDown for this.
+          if (!cooldownAnnounced &&
+              activeProfile.steps[activeStep].targetTemp < step.targetTemp)
+          {
+            cooldownAnnounced = true;
+            beepcount = 3; // Beep! We need the door open!!!
+          }
+        }
+      }
+
+      // Far above the corridor with the heat quantised and bounded: a welded
+      // contact or a shorted drive looks like this and little else does.
+      if (aktSystemTemperature > corridorHigh + CORRIDOR_ABORT_C)
+      {
+        reportError("Temperature is Way to HOT!!!!!");
+      }
+
+      powerHeater = (uint16_t)powerLevel * 255 / (POWER_LEVELS - 1);
+    }
+    else if (currentState == MeasureLag)
+    {
+      // Measures the oven's thermal lag by performing the experiment the
+      // approach clamp relies on: hold a fixed level to a known temperature,
+      // open the relay, and see how far the oven carries on climbing.
+      //
+      //     lag = (peak - temp at cut) / rate at cut
+      //
+      // Note this deliberately measures the whole cut-to-peak behaviour,
+      // including up to one relay window of residual on-time after the demand
+      // drops -- relayDriver() latches per window, so the contacts can stay
+      // closed briefly after the cut. That latency is present during a real
+      // profile too, and the projection has to cover it, so folding it into
+      // the number is right rather than something to correct out.
+      static bool  coasting = false;
+      static float cutTemp = 0.0f, cutRate = 0.0f, peakTemp = 0.0f;
+      static uint64_t phaseStart_ms = time_ms;
+
+      if (stateChanged)
+      {
+        coasting      = false;
+        phaseStart_ms = time_ms;
+        peakTemp      = aktSystemTemperature;
+        measuredLagSec = 0.0f;
+        powerLevel    = MEASURE_LEVEL;
+      }
+
+      if (!coasting)
+      {
+        powerLevel = MEASURE_LEVEL;
+
+        if (aktSystemTemperature >= measureTempC)
+        {
+          if (aktSystemTemperatureRamp < MEASURE_MIN_RATE_C_S)
+          {
+            // Arrived, but not climbing: nothing to divide by, and the answer
+            // would be meaningless rather than merely wrong.
+            reportError("Lag measurement: oven not climbing at cut");
+          }
+          else
+          {
+            cutTemp       = aktSystemTemperature;
+            cutRate       = aktSystemTemperatureRamp;
+            peakTemp      = aktSystemTemperature;
+            coasting      = true;
+            powerLevel    = 0;
+            phaseStart_ms = time_ms;
+            Serial.printf("Lag measurement: cut at %.1fC rising %.2fC/s\n",
+                          cutTemp, cutRate);
+          }
+        }
+        else if (time_ms - phaseStart_ms > (uint64_t)MEASURE_HEAT_TIMEOUT_S * 1000)
+        {
+          reportError("Lag measurement: oven never reached measure temp");
+        }
+      }
+      else
+      {
+        powerLevel = 0;
+
+        if (aktSystemTemperature > peakTemp) peakTemp = aktSystemTemperature;
+
+        bool peaked  = (aktSystemTemperatureRamp <= 0.0f) &&
+                       (time_ms - phaseStart_ms > 2000); // let the cut register
+        bool gaveUp  = (time_ms - phaseStart_ms >
+                        (uint64_t)MEASURE_COAST_TIMEOUT_S * 1000);
+
+        if (peaked || gaveUp)
+        {
+          measuredLagSec = (peakTemp - cutTemp) / cutRate;
+          if (measuredLagSec < THERMAL_LAG_MIN_S) measuredLagSec = THERMAL_LAG_MIN_S;
+          if (measuredLagSec > THERMAL_LAG_MAX_S) measuredLagSec = THERMAL_LAG_MAX_S;
+
+          thermalLagSec = measuredLagSec;
+          saveOven();
+
+          Serial.printf("Lag measurement: peak %.1fC, coast %.1fC, lag %.1fs%s\n",
+                        peakTemp, peakTemp - cutTemp, measuredLagSec,
+                        gaveUp ? " (COAST TIMED OUT -- treat as a lower bound)" : "");
+
+          currentState = Complete;
+          powerLevel   = 0;
+          beepcount    = 2;
+        }
+      }
+
+      powerHeater = (uint16_t)powerLevel * 255 / (POWER_LEVELS - 1);
+    }
     else if(currentState == Manual)
     {
       powerHeater=((uint16_t)manualPower*255)/100;
     }
     else
     {
-      powerHeater =0;
+      powerLevel  = 0;
+      powerHeater = 0;
     }
   }
 

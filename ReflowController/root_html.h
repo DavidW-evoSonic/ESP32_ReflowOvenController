@@ -16,6 +16,8 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             chartdata.addColumn({type: 'string', role: 'annotation'});
             chartdata.addColumn('number', "Temperatur");
             chartdata.addColumn('number', "Setpoint");
+            chartdata.addColumn('number', "Corridor low");
+            chartdata.addColumn('number', "Corridor high");
             chartdata.addColumn('number', "Power");
         }
         initchartdata();
@@ -31,6 +33,14 @@ const char ROOT_HTML[] PROGMEM = R"=====(
               targetAxisIndex: 0
             },
             2: {
+              targetAxisIndex: 0,
+              lineDashStyle: [3, 3]
+            },
+            3: {
+              targetAxisIndex: 0,
+              lineDashStyle: [3, 3]
+            },
+            4: {
               targetAxisIndex: 1
             }
           },
@@ -128,7 +138,8 @@ const char ROOT_HTML[] PROGMEM = R"=====(
              
 
              if(data.state!="Ready" && data.state!="Complete"){
-                 chartdata.addRow([data.time/1000, lable, data.temp, data.setpoint, data.power]);
+                 chartdata.addRow([data.time/1000, lable, data.temp, data.setpoint,
+                                   data.low, data.high, data.power]);
                  classicOptions.hAxis.viewWindow.max=Math.max(100,Math.round(data.time/1000.0)+10);
              }
              if(data.state=="Ready")
@@ -152,11 +163,8 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         loadstatus();
 
         // Everything below replaces the rotary-encoder menu: profile slots,
-        // profile fields, PID gains, autotune parameters and manual heating.
-        var PROFILE_FIELDS = ['name','rampUpRate','soakTemp','soakDuration',
-                              'peakTemp','peakDuration','rampDownRate'];
-        var PID_FIELDS     = ['kp','ki','kd'];
-        var TUNING_FIELDS  = ['output','noiseBand','step','lookback'];
+        // the step list and manual heating. There are no gains to edit any
+        // more -- the corridor law has nothing to tune.
 
         function act(path, params){
             return $.ajax({
@@ -169,11 +177,20 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             });
         }
 
+        // One step per line, "target, min, max", which is the shape a solder
+        // paste datasheet states a profile in.
         function loadConfig(){
             $.getJSON("config?t="+Date.now()).done(function(c){
-                PROFILE_FIELDS.forEach(function(f){ $('#p_'+f).val(c.profile[f]); });
-                PID_FIELDS.forEach(function(f){ $('#pid_'+f).val(c.pid[f]); });
-                TUNING_FIELDS.forEach(function(f){ $('#tune_'+f).val(c.tuning[f]); });
+                $('#p_name').val(c.profile.name);
+                $('#p_steps').val(c.profile.steps.map(function(s){
+                    return s.targetTemp+", "+s.minDuration+", "+s.maxDuration;
+                }).join("\n"));
+                $('#p_limit').text(c.maxSteps);
+                $('#o_thermalLag').val(c.oven.thermalLag);
+                $('#o_measureTemp').val(c.oven.measureTemp);
+                $('#o_measured').text(c.oven.measuredLag > 0
+                    ? "last measured: "+c.oven.measuredLag+" s"
+                    : "not measured this power-up");
             });
             $.getJSON("profiles?t="+Date.now()).done(function(d){
                 var sel = $('#slot').empty();
@@ -185,20 +202,12 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         }
         loadConfig();
 
-        function collect(prefix, fields){
-            var out = {};
-            fields.forEach(function(f){ out[f] = $('#'+prefix+f).val(); });
-            return out;
-        }
-
         $('#p_apply').click(function(){
-            act("profile/edit", collect('p_', PROFILE_FIELDS)).done(loadConfig);
-        });
-        $('#pid_apply').click(function(){
-            act("pid", collect('pid_', PID_FIELDS)).done(loadConfig);
-        });
-        $('#tune_apply').click(function(){
-            act("tuning", collect('tune_', TUNING_FIELDS)).done(loadConfig);
+            var steps = $('#p_steps').val().split("\n").map(function(l){
+                return l.trim().replace(/\s+/g, "");
+            }).filter(function(l){ return l.length; }).join(";");
+            act("profile/edit", {name: $('#p_name').val(), steps: steps})
+                .done(loadConfig);
         });
         $('#load').click(function(){
             act("profile/load", {id: $('#slot').val()}).done(loadConfig);
@@ -206,9 +215,15 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         $('#save').click(function(){
             act("profile/save", {id: $('#slot').val()}).done(loadConfig);
         });
-        $('#autotune').click(function(){
-            if(confirm("Run autotune? This heats the oven for a long time."))
-                act("tune");
+        $('#o_apply').click(function(){
+            act("oven", {thermalLag: $('#o_thermalLag').val(),
+                         measureTemp: $('#o_measureTemp').val()}).done(loadConfig);
+        });
+        $('#o_measure').click(function(){
+            if(confirm("Measure thermal lag? The oven heats to the measure "
+                     + "temperature and is then deliberately allowed to "
+                     + "overshoot. It writes the result to the lag setting."))
+                act("measurelag");
         });
         $('#manual_set').click(function(){
             act("manual", {power: $('#manual_power').val()});
@@ -262,30 +277,22 @@ const char ROOT_HTML[] PROGMEM = R"=====(
 
           <fieldset><legend>Profile</legend>
             <label>Name <input id="p_name" maxlength="10" size="10"></label><br>
-            <label>Ramp up (&deg;C/s) <input id="p_rampUpRate" type="number" step="0.1" size="5"></label><br>
-            <label>Soak temp (&deg;C) <input id="p_soakTemp" type="number" size="5"></label><br>
-            <label>Soak time (s) <input id="p_soakDuration" type="number" size="5"></label><br>
-            <label>Peak temp (&deg;C) <input id="p_peakTemp" type="number" size="5"></label><br>
-            <label>Peak time (s) <input id="p_peakDuration" type="number" size="5"></label><br>
-            <label>Ramp down (&deg;C/s) <input id="p_rampDownRate" type="number" step="0.1" size="5"></label><br>
+            <label>Steps &mdash; one per line, <code>target&deg;C, min s, max s</code>
+              (max <span id="p_limit">?</span>)<br>
+              <textarea id="p_steps" rows="7" cols="24"></textarea></label><br>
             <button id="p_apply">Apply</button>
             <span>(not stored until saved to a slot)</span>
           </fieldset>
 
-          <fieldset><legend>PID</legend>
-            <label>Kp <input id="pid_kp" type="number" step="0.01" size="5"></label>
-            <label>Ki <input id="pid_ki" type="number" step="0.01" size="5"></label>
-            <label>Kd <input id="pid_kd" type="number" step="0.01" size="5"></label>
-            <button id="pid_apply">Apply</button>
-          </fieldset>
-
-          <fieldset><legend>Autotune</legend>
-            <label>Output (%) <input id="tune_output" type="number" size="4"></label>
-            <label>Noise band <input id="tune_noiseBand" type="number" size="4"></label>
-            <label>Step (%) <input id="tune_step" type="number" size="4"></label>
-            <label>Lookback (s) <input id="tune_lookback" type="number" size="4"></label>
-            <button id="tune_apply">Apply</button>
-            <button id="autotune">Run autotune</button>
+          <fieldset><legend>Oven (thermal inertia)</legend>
+            <label>Thermal lag (s) <input id="o_thermalLag" type="number" step="0.1" size="5"></label>
+            <label>Measure at (&deg;C) <input id="o_measureTemp" type="number" size="5"></label>
+            <button id="o_apply">Apply</button>
+            <button id="o_measure">Measure</button><br>
+            <span id="o_measured"></span><br>
+            <span>How far the oven keeps climbing after the relay opens. Measure
+              it loaded with a representative board &mdash; an empty oven is a
+              different oven.</span>
           </fieldset>
 
           <fieldset><legend>Manual heating</legend>
