@@ -72,6 +72,40 @@
 #define AD595_MV_PER_C        10.0f
 #define TEMP_DIVIDER_RATIO     1.5f
 #define TEMP_OVERSAMPLE         64
+
+// Spread the oversample burst evenly across exactly one mains cycle.
+//
+// A thermocouple on long leads inside an oven, next to the element's mains
+// wiring, into a high-gain amplifier, is about the best hum antenna you could
+// build. Taken back to back the 64 samples span about a millisecond -- a
+// twentieth of a cycle -- so they all sit on the same part of the sine wave
+// and average to that part of it rather than to zero. The burst then rides up
+// and down at the beat between the sample rate and the mains, which lands
+// straight on the rate term.
+//
+// Sampled uniformly over one whole period, the average cancels the mains
+// fundamental *and* every harmonic of it, which is why this is worth 20 ms of
+// each 100 ms interval and no extra parts.
+//
+// The input filter cannot do this job. Its corner is at 240 Hz, chosen to keep
+// RF out of the ADC pin, and a single pole there attenuates 50 Hz by 2% -- for
+// mains the sampling is the whole defence.
+//
+// The two do complement each other, though. Uniform sampling cancels every
+// harmonic *except* multiples of the sample rate, which alias to DC: with 64
+// samples across the period that is 3.2 kHz, and the filter is 22 dB down by
+// there. Worth keeping in step if either number changes.
+//
+// Note also that the filter's 663 us time constant is longer than the 312 us
+// sample spacing, so adjacent samples are correlated and the burst does not
+// buy the full sqrt(64) on broadband noise. Mains rejection is unaffected --
+// hum is deterministic, and uniform coverage of the period cancels it
+// regardless of what the samples do in between.
+//
+// This oven runs on 50 Hz (Australia), so 20000. 60 Hz mains needs 16667 or
+// rejection drops to 84%. 100000 would cover both -- 5 cycles at 50, 6 at 60
+// -- but that is the entire read interval, leaving nothing for the web server.
+#define TEMP_SAMPLE_SPAN_US  20000
 // The MAX31855 reported open/short faults on its status bits. The AD595 has no
 // such channel, but an open thermocouple drives its output to the rail, so an
 // implausibly high reading stands in for the same fault.
@@ -410,11 +444,39 @@ void setLEDRGBBColor(uint8_t r, uint8_t g, uint8_t b)
 // sensor fault.
 float readTemperature() {
   uint32_t sum = 0;
+  const int64_t t0 = esp_timer_get_time();
+
   for (uint8_t i = 0; i < TEMP_OVERSAMPLE; i++) {
+    // Each sample is due at a fixed offset from the start of the burst, not a
+    // fixed delay after the previous one. Scheduling against t0 means a slow
+    // read is absorbed by the next slot instead of stretching the window --
+    // and the window has to stay one mains period for any of this to work.
+    const int64_t due = t0 + ((int64_t)TEMP_SAMPLE_SPAN_US * i) / TEMP_OVERSAMPLE;
+    while (esp_timer_get_time() < due) { /* ~300us, not worth a yield */ }
+
     sum += adc1_get_raw(TEMP_ADC_CH);
   }
 
-  uint32_t mv = esp_adc_cal_raw_to_voltage(sum / TEMP_OVERSAMPLE, &adcChars);
+  // Keep the fraction the oversample earned. Averaging 64 samples and then
+  // integer-dividing hands back a plain 12-bit number, and esp_adc_cal returns
+  // whole millivolts on top of that -- about 0.15 degC per count through the
+  // 1.5:1 divider. So the oversample bought noise rejection and then threw the
+  // extra resolution away, with a half-count downward bias for good measure.
+  //
+  // That matters more than 0.15 degC sounds, because the rate term is a
+  // difference of two averages and the projection multiplies it by the lag: a
+  // staircase in temperature becomes a staircase in degC/s, amplified. And
+  // heavy oversampling makes it worse rather than better -- it removes the
+  // very noise that would otherwise dither the outer rolling average across
+  // the quantisation and let it interpolate.
+  //
+  // esp_adc_cal_raw_to_voltage is linear over one count, so interpolating
+  // between the two neighbouring conversions recovers both lost fractions.
+  uint32_t whole = sum / TEMP_OVERSAMPLE;
+  uint32_t frac  = sum % TEMP_OVERSAMPLE;
+  uint32_t mvLo  = esp_adc_cal_raw_to_voltage(whole,     &adcChars);
+  uint32_t mvHi  = esp_adc_cal_raw_to_voltage(whole + 1, &adcChars);
+  float    mv    = mvLo + (float)(mvHi - mvLo) * frac / TEMP_OVERSAMPLE;
 
   return (mv * TEMP_DIVIDER_RATIO) / AD595_MV_PER_C;
 }
