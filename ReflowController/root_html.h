@@ -190,13 +190,16 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             });
         }
 
-        // One step per line, "target, min, max", which is the shape a solder
-        // paste datasheet states a profile in.
+        // One step per line, "target, lo, hi" plus an optional unit: bare or
+        // "s" for seconds, "r" for degC/s. Both shapes are how paste
+        // datasheets state a profile, and which one a step uses decides what
+        // stays fixed when the chamber starts warm.
         function loadConfig(){
             $.getJSON("config?t="+Date.now()).done(function(c){
                 $('#p_name').val(c.profile.name);
                 $('#p_steps').val(c.profile.steps.map(function(s){
-                    return s.targetTemp+", "+s.minDuration+", "+s.maxDuration;
+                    return s.targetTemp+", "+s.lo+", "+s.hi
+                         + (s.bound=="rate" ? ", r" : "");
                 }).join("\n"));
                 $('#p_limit').text(c.maxSteps);
                 $('#o_thermalLag').val(c.oven.thermalLag);
@@ -291,9 +294,14 @@ const char ROOT_HTML[] PROGMEM = R"=====(
 
           <fieldset><legend>Profile</legend>
             <label>Name <input id="p_name" maxlength="10" size="10"></label><br>
-            <label>Steps &mdash; one per line, <code>target&deg;C, min s, max s</code>
-              (max <span id="p_limit">?</span>)<br>
-              <textarea id="p_steps" rows="7" cols="24"></textarea></label><br>
+            <label>Steps &mdash; one per line, max <span id="p_limit">?</span>:<br>
+              <code>target&deg;C, min s, max s</code> &nbsp;or&nbsp;
+              <code>target&deg;C, min &deg;C/s, max &deg;C/s, r</code><br>
+              <textarea id="p_steps" rows="7" cols="34"></textarea></label><br>
+            <span>Rate-bounded steps shorten when the chamber starts warm
+              instead of flattening &mdash; use them for a ramp from ambient.
+              Duration-bounded steps hold their time, which is what a soak or a
+              peak needs.</span><br>
             <button id="p_apply">Apply</button>
             <span>(not stored until saved to a slot)</span>
           </fieldset>

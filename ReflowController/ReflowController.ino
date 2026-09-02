@@ -133,8 +133,8 @@
 
 // Rate-corridor control (see PORTING_ANALYSIS.md).
 //
-// A profile is a list of steps, each "reach targetTemp in between minDuration
-// and maxDuration seconds". That pair defines a corridor rather than a single
+// A profile is a list of steps, each "reach targetTemp no sooner than this and
+// no later than that". That pair defines a corridor rather than a single
 // setpoint, and the controller nudges a discrete power level to keep both the
 // temperature and its rate of change inside it. There are no gains to tune:
 // the coarseness of a mechanical relay is the design premise rather than a
@@ -231,7 +231,7 @@
 // a shorted drive transistor looks like this, and nothing else does.
 #define CORRIDOR_ABORT_C   100.0f
 
-// A heating step that times out on maxDuration this far short of its target has
+// A heating step that times out on its slow bound this far short of target has
 // not merely run slow -- the element is not heating. The PID build had no such
 // check: its state machine advanced on the computed setpoint, so a dead element
 // ran the whole profile through to Complete without ever warming the oven.
@@ -239,18 +239,14 @@
 
 // A profile may not start from a warm chamber.
 //
-// Two reasons, and the second is the one that bites quietly. A hot oven is a
-// hazard to load -- reaching into it is how you get burnt, and the door has to
-// be open to do it. And step corridors rebase on the measured temperature at
-// step entry while their durations are absolute, so the same profile started
-// warm is a materially different thermal history: step 0 of the default
-// profile needs 0.81-1.05 degC/s from 25 degC but only 0.61-0.80 degC/s from
-// 60 degC, and that slower ramp spends far longer drying the flux out before
-// the board ever reaches liquidus. The second board of a batch would reflow
-// differently from the first with no fault raised anywhere.
+// A hot oven is a hazard to load -- reaching into it is how you get burnt, and
+// the door has to be open to do it. 50 degC is warm to the touch and no worse.
 //
-// This bounds that variation rather than removing it -- see REWORK_NOTES 7.7.
-#define PROFILE_START_MAX_C   60
+// BOUND_RATE now removes the profile-consistency half of this for any step
+// that declares itself rate-bounded, which the default step 0 does. What is
+// left is the plain hazard: an oven at reflow temperature is not something to
+// reach into, and it has to be open to be loaded.
+#define PROFILE_START_MAX_C   50
 
 // The door-open prompt waits for the coast to finish.
 //
@@ -297,19 +293,53 @@
 #include "root_html.h"
 
 //structs
-// One profile segment: reach targetTemp no sooner than minDuration and no later
-// than maxDuration seconds after the step began. Those two bounds are the
-// corridor. This is how a solder paste datasheet states its profile ("ramp to
-// 150degC in 60-90s"), so a profile can be transcribed rather than converted.
+// One profile segment: reach targetTemp no sooner than its fast bound and no
+// later than its slow bound. Those two are the corridor, and each step says
+// whether it states them as durations or as rates -- see BOUND_DURATION. This
+// is how a solder paste datasheet states a profile ("ramp to 150degC in
+// 60-90s", "1-3 degC/s"), so one can be transcribed rather than converted.
 //
 // A step's corridor is rebased on the measured temperature when the step
 // begins, not on the previous step's target, so a warm oven or an overshoot
 // carries forward as a gentler rate rather than an impossible one.
+// How a step's two bounds are stated. Which invariant is correct differs by
+// step, which is why it is per-step rather than a property of the profile:
+//
+// A preheat from ambient wants a fixed *rate*. Its start temperature is
+// whatever the chamber happens to be, so pinning the duration makes the same
+// profile a different thermal history every time -- from 25 degC the default
+// step 0 needs 0.81-1.05 degC/s, from 50 degC only 0.67-0.87, and the slower
+// ramp spends far longer drying the flux out. Stated as a rate, a warm start
+// shortens the step instead of flattening it.
+//
+// A soak or a peak wants a fixed *duration*, because time at temperature is
+// what drives flux activation and intermetallic growth. Its start temperature
+// is the previous step's target, so it does not drift anyway.
+//
+// Paste datasheets state both forms -- "1-3 degC/s" and "60-90 s" -- for
+// exactly this reason. Forcing everything into durations was what made a warm
+// start silently change the profile.
+#define BOUND_DURATION 0
+#define BOUND_RATE     1
+
 typedef struct step_s {
   int16_t targetTemp;   // degC
-  int16_t minDuration;  // s, fastest acceptable -- reaching it sooner is "ahead"
-  int16_t maxDuration;  // s, slowest acceptable -- and the step's watchdog
+  // Both bounds are stated in ascending order of the unit they use, which is
+  // the order a datasheet prints and a person types. Note that puts "fastest"
+  // at opposite ends: the shortest duration is the fastest, but so is the
+  // *highest* rate. deriveStepDurations() is the one place that flips it.
+  int16_t boundLo;      // BOUND_DURATION: min seconds. BOUND_RATE: min centi-degC/s
+  int16_t boundHi;      // BOUND_DURATION: max seconds. BOUND_RATE: max centi-degC/s
+  uint8_t boundIsRate;  // BOUND_DURATION or BOUND_RATE
 } Step_t;
+
+// Rates are stored as hundredths of a degree per second so the whole profile
+// stays integral in Preferences. 0.72 degC/s is 72.
+#define RATE_SCALE      100.0f
+#define RATE_MIN_CDS      1     // 0.01 degC/s
+#define RATE_MAX_CDS   2000     // 20.00 degC/s
+#define DURATION_MIN_S    1
+#define DURATION_MAX_S  999
 
 // data type for the values used in the reflow profile
 typedef struct profileValues_s {
@@ -555,6 +585,36 @@ void relayDriver()
 }
 
 
+// A step's effective duration window, in seconds.
+//
+// A duration-bounded step states it. A rate-bounded step derives it from how
+// far it actually has to go, which is the whole point: cover less ground and
+// the step gets shorter rather than gentler. delta is signed; only its
+// magnitude matters here.
+//
+// The high rate is the *fast* bound and so yields the *minimum* duration.
+static void deriveStepDurations(const Step_t &step, float delta,
+                                float *minDur, float *maxDur)
+{
+  if (step.boundIsRate == BOUND_RATE)
+  {
+    const float absDelta = fabsf(delta);
+    const float rateFast = step.boundHi / RATE_SCALE;
+    const float rateSlow = step.boundLo / RATE_SCALE;
+    *minDur = (rateFast > 0.0f) ? absDelta / rateFast : 0.0f;
+    *maxDur = (rateSlow > 0.0f) ? absDelta / rateSlow : 0.0f;
+    // Already at the target is a satisfied rate step, not a zero-length wait
+    // for something to happen -- but never let the watchdog precede the floor.
+    if (*maxDur < *minDur) *maxDur = *minDur;
+  }
+  else
+  {
+    *minDur = step.boundLo;
+    *maxDur = step.boundHi;
+  }
+}
+
+
 const char * currentStateToString()
 {
   #define casePrintState(state) case state: return #state;
@@ -593,18 +653,26 @@ void loadProfile(unsigned int targetProfile) {
 // coast-down segments.
 void makeDefaultProfile() {
   snprintf(activeProfile.name,PROFILE_NAME_LENGTH,"%s","LeadFree");
+  //
+  // Step 0 is rate-bounded and the rest are duration-bounded, which is the
+  // distinction BOUND_RATE exists for. 0.72-0.94 degC/s is exactly what
+  // "40 -> 170 degC in 138-180 s" means, so this is the same measured
+  // behaviour restated in the invariant that survives a warm chamber. The
+  // remaining steps start from the previous step's target rather than from
+  // ambient, and their durations are the thing that matters chemically, so
+  // they keep the measured seconds.
   static const Step_t defaultSteps[] = {
-    { 170, 138, 180 },
-    { 220,  31,  64 },
-    { 243,  21,  28 },
-    { 220,  21,  28 },
-    { 150,  30,  45 },
-    {  30,  20,  30 },
+    { 170,  72,  94, BOUND_RATE     },  // 0.72-0.94 degC/s
+    { 220,  31,  64, BOUND_DURATION },
+    { 243,  21,  28, BOUND_DURATION },
+    { 220,  21,  28, BOUND_DURATION },
+    { 150,  30,  45, BOUND_DURATION },
+    {  30,  20,  30, BOUND_DURATION },
   };
   activeProfile.stepCount = sizeof(defaultSteps)/sizeof(defaultSteps[0]);
   memcpy(activeProfile.steps, defaultSteps, sizeof(defaultSteps));
   for (uint8_t i = activeProfile.stepCount; i < MAX_STEPS; i++) {
-    activeProfile.steps[i] = (Step_t){0,0,0};
+    activeProfile.steps[i] = (Step_t){0,0,0,BOUND_DURATION};
   }
 }
 
@@ -642,8 +710,18 @@ bool loadParameters(uint8_t profile) {
     // A size match is not a validity guarantee -- a struct change that happened
     // to keep the same size would read as garbage -- so bound it here rather
     // than trusting it at the point where it is used to subscript.
-    if (activeProfile.stepCount < 1 || activeProfile.stepCount > MAX_STEPS) {
-      Serial.println("PROFILE step count implausible, loading default");
+    bool sane = (activeProfile.stepCount >= 1 &&
+                 activeProfile.stepCount <= MAX_STEPS);
+    for (uint8_t i = 0; sane && i < activeProfile.stepCount; i++) {
+      const Step_t &st = activeProfile.steps[i];
+      // boundIsRate selects how boundLo/Hi are interpreted, and a rate step
+      // divides by them, so an unrecognised value or a zero bound has to be
+      // caught here rather than in the control loop.
+      if (st.boundIsRate > BOUND_RATE) sane = false;
+      if (st.boundLo < 1 || st.boundHi < st.boundLo) sane = false;
+    }
+    if (!sane) {
+      Serial.println("PROFILE implausible, loading default");
       makeDefaultProfile();
     }
   }  
@@ -848,9 +926,14 @@ void setup() {
                  "\", \"steps\": [";
     for (uint8_t i = 0; i < activeProfile.stepCount; i++) {
       if (i) out += ",";
-      out += "{\"targetTemp\": "  + String(activeProfile.steps[i].targetTemp) +
-             ", \"minDuration\": " + String(activeProfile.steps[i].minDuration) +
-             ", \"maxDuration\": " + String(activeProfile.steps[i].maxDuration) + "}";
+      const Step_t &st = activeProfile.steps[i];
+      bool isRate = (st.boundIsRate == BOUND_RATE);
+      out += "{\"targetTemp\": " + String(st.targetTemp) +
+             ", \"bound\": \"" + (isRate ? "rate" : "duration") + "\"" +
+             ", \"lo\": " + (isRate ? String(st.boundLo / RATE_SCALE, 2)
+                                     : String(st.boundLo)) +
+             ", \"hi\": " + (isRate ? String(st.boundHi / RATE_SCALE, 2)
+                                     : String(st.boundHi)) + "}";
     }
     out += "]}, \"maxSteps\": " + String(MAX_STEPS) +
            ", \"oven\": {\"thermalLag\": " + String(thermalLagSec, 1) +
@@ -867,9 +950,9 @@ void setup() {
       serverAction.send(409, "text/plain", "Controller busy");
       return;
     }
-    // A warm chamber is both a hazard to load and a different profile: see
-    // PROFILE_START_MAX_C. Let it cool rather than quietly running a slower
-    // ramp that dries the flux out.
+    // A hot chamber is not something to reach into, and it has to be open to
+    // be loaded. The profile-consistency half of this is BOUND_RATE's job now,
+    // not the lockout's -- see PROFILE_START_MAX_C.
     if(aktSystemTemperature > PROFILE_START_MAX_C)
     {
       char msg[96];
@@ -1020,8 +1103,11 @@ void setup() {
   // Edits the in-memory profile. Not persisted until /profile/save, matching
   // how the menu behaved: edit freely, then choose a slot to write to.
   //
-  // Steps arrive as one "target,min,max" triple per step, semicolon separated:
-  //   steps=170,138,180;220,31,64;243,21,28
+  // Steps arrive as one "target,lo,hi[,unit]" record per step, semicolon
+  // separated. The optional unit is "s" for seconds (the default) or "r" for
+  // degC/s, which is what selects the step's bound type:
+  //   steps=170,0.72,0.94,r;220,31,64;243,21,28
+  // Both bounds ascend in whatever unit they use, as a datasheet prints them.
   // The whole list is replaced or none of it is -- a half-applied profile would
   // be a corridor that no longer joins up.
   serverAction.on("/profile/edit", []() {
@@ -1060,24 +1146,54 @@ void setup() {
           serverAction.send(400, "text/plain", "ERROR");
           return;
         }
+        int c3 = field.indexOf(',', c2 + 1);   // optional unit
+
+        String loStr = field.substring(c1 + 1, c2);
+        String hiStr = (c3 < 0) ? field.substring(c2 + 1)
+                                : field.substring(c2 + 1, c3);
+        String unit  = (c3 < 0) ? String("s") : field.substring(c3 + 1);
+        unit.toLowerCase();
+
+        bool isRate = unit.startsWith("r");
+        if (!isRate && !unit.startsWith("s"))
+        {
+          serverAction.send(400, "text/plain",
+                            "Step unit must be 's' (seconds) or 'r' (degC/s)");
+          return;
+        }
 
         long target = field.substring(0, c1).toInt();
-        long lo     = field.substring(c1 + 1, c2).toInt();
-        long hi     = field.substring(c2 + 1).toInt();
+        long lo, hi;
+        if (isRate)
+        {
+          // degC/s on the wire, hundredths in the struct.
+          lo = lroundf(loStr.toFloat() * RATE_SCALE);
+          hi = lroundf(hiStr.toFloat() * RATE_SCALE);
+          if (lo < RATE_MIN_CDS) lo = RATE_MIN_CDS;
+          if (lo > RATE_MAX_CDS) lo = RATE_MAX_CDS;
+          if (hi < lo) hi = lo;              // an inverted corridor has no inside
+          if (hi > RATE_MAX_CDS) hi = RATE_MAX_CDS;
+        }
+        else
+        {
+          lo = loStr.toInt();
+          hi = hiStr.toInt();
+          if (lo < DURATION_MIN_S) lo = DURATION_MIN_S;
+          if (lo > DURATION_MAX_S) lo = DURATION_MAX_S;
+          if (hi < lo) hi = lo;
+          if (hi > DURATION_MAX_S) hi = DURATION_MAX_S;
+        }
 
         // Held below TEMP_PLAUSIBLE_MAX_C: a profile must not be able to ask
         // for a temperature that would trip the sensor fault on the way to
         // reaching it.
         if (target <   0) target =   0;
         if (target > 280) target = 280;
-        if (lo <   1) lo =   1;
-        if (lo > 999) lo = 999;
-        if (hi <  lo) hi =  lo;   // an inverted corridor has no inside
-        if (hi > 999) hi = 999;
 
         parsed[count].targetTemp  = (int16_t)target;
-        parsed[count].minDuration = (int16_t)lo;
-        parsed[count].maxDuration = (int16_t)hi;
+        parsed[count].boundLo     = (int16_t)lo;
+        parsed[count].boundHi     = (int16_t)hi;
+        parsed[count].boundIsRate = isRate ? BOUND_RATE : BOUND_DURATION;
         count++;
       }
 
@@ -1089,7 +1205,7 @@ void setup() {
 
       activeProfile.stepCount = count;
       for (uint8_t i = 0; i < MAX_STEPS; i++) {
-        activeProfile.steps[i] = (i < count) ? parsed[i] : (Step_t){0,0,0};
+        activeProfile.steps[i] = (i < count) ? parsed[i] : (Step_t){0,0,0,BOUND_DURATION};
       }
     }
     serverAction.send(200, "text/plain", "OK");
@@ -1262,11 +1378,17 @@ void loop()
 
       float elapsed_s = (time_ms - stepStartedTime_ms) / 1000.0f;
 
+      // The step's duration window, stated or derived from its rate bounds.
+      // Recomputed each pass, but delta only changes at step entry, so this is
+      // constant across a step.
+      float minDur, maxDur;
+      deriveStepDurations(step, delta, &minDur, &maxDur);
+
       // Where the corridor says the oven should be by now, as a fraction of the
-      // step. Reaching the target sooner than minDuration is "ahead", later
-      // than maxDuration is "behind".
-      float aheadFrac  = (step.minDuration > 0) ? elapsed_s / step.minDuration : 1.0f;
-      float behindFrac = (step.maxDuration > 0) ? elapsed_s / step.maxDuration : 1.0f;
+      // step. Reaching the target sooner than minDur is "ahead", later than
+      // maxDur is "behind".
+      float aheadFrac  = (minDur > 0.0f) ? elapsed_s / minDur : 1.0f;
+      float behindFrac = (maxDur > 0.0f) ? elapsed_s / maxDur : 1.0f;
       if (aheadFrac  > 1.0f) aheadFrac  = 1.0f;
       if (behindFrac > 1.0f) behindFrac = 1.0f;
 
@@ -1334,8 +1456,8 @@ void loop()
             // profile rates of 0.72-1.61 -- barely one bit -- so this term
             // actually contributes here in a way it never did there.
             float normRate = aktSystemTemperatureRamp / delta; // fraction of step per second
-            if (step.maxDuration > 0 && normRate < 1.0f / step.maxDuration) nudge = 1;
-            else if (step.minDuration > 0 && normRate > 1.0f / step.minDuration) nudge = -1;
+            if (maxDur > 0.0f && normRate < 1.0f / maxDur) nudge = 1;
+            else if (minDur > 0.0f && normRate > 1.0f / minDur) nudge = -1;
           }
         }
 
@@ -1403,8 +1525,8 @@ void loop()
       bool reached  = isDwell ||
                       (dir > 0.0f ? (projectedTemp >= step.targetTemp)
                                   : (aktSystemTemperature <= step.targetTemp));
-      bool minMet   = elapsed_s >= step.minDuration;
-      bool timedOut = elapsed_s >= step.maxDuration;
+      bool minMet   = elapsed_s >= minDur;
+      bool timedOut = elapsed_s >= maxDur;
 
       if ((minMet && reached) || timedOut)
       {

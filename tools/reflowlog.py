@@ -206,8 +206,8 @@ def main():
     print()
     print("Take the hottest. Peak overshoot is what damages parts, so the one")
     print("constant should be honest at that end of the range; being long")
-    print("lower down only costs a slightly slow ramp, which maxDuration")
-    print("absorbs.")
+    print("lower down only costs a slightly slow ramp, which the step's")
+    print("slow bound absorbs.")
     print()
     print("  curl 'http://<oven>:8080/oven?thermalLag=%.1f'" % hottest["lag"])
 
