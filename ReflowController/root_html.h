@@ -81,6 +81,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         var classicChart = new google.visualization.LineChart(document.getElementById('chart_div'));
         var lastState= "";
         var running=false;
+        var startMax=null;   // from /config: chamber must be below this to start
         function loadstatus()
         {
           var lastcall=Date.now();
@@ -107,6 +108,12 @@ const char ROOT_HTML[] PROGMEM = R"=====(
 
              console.log( "success", data );
 
+             if(data.openDoor){
+                 $('#door').show();
+             } else {
+                 $('#door').hide();
+             }
+
              if(data.fault){
                  $('#fault').text("FAULT: "+data.fault+" -- power cycle the oven").show();
              }
@@ -116,8 +123,11 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                  //clear all
                  initchartdata();
                  lastState="Ready";
-                 $('#action').text("Start Reflow");
                  running=false;
+                 $('#action').text(
+                     (startMax!==null && data.temp > startMax)
+                     ? "Too hot ("+Math.round(data.temp)+"\u00B0C)"
+                     : "Start Reflow");
              }
              else{
                  if(data.state=="Complete"){
@@ -172,8 +182,11 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                 data: $.extend({t: Date.now()}, params || {}),
                 dataType: "text"
             }).fail(function(x){
-                alert(x.status==409 ? "Controller busy -- stop the cycle first."
-                                    : "Communication error!");
+                var why = (x.responseText||"").trim();
+                alert(x.status==409
+                      ? (why && why!="ERROR" ? why
+                         : "Controller busy -- stop the cycle first.")
+                      : "Communication error!");
             });
         }
 
@@ -188,6 +201,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                 $('#p_limit').text(c.maxSteps);
                 $('#o_thermalLag').val(c.oven.thermalLag);
                 $('#o_measureTemp').val(c.oven.measureTemp);
+                startMax = c.oven.startMaxTemp;
                 $('#o_measured').text(c.oven.measuredLag > 0
                     ? "last measured: "+c.oven.measuredLag+" s"
                     : "not measured this power-up");
@@ -304,6 +318,10 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             <button id="reset">Factory reset</button>
           </fieldset>
         </div>
+    </div>
+    <div id="door" style="display:none; background:#fd7; border:2px solid #a70;
+         padding:6px; margin:4px 0; font-weight:bold">
+      Peak reached &mdash; OPEN THE OVEN DOOR NOW
     </div>
     <div id="chart_div" style="width: 100%; height: 100%;"></div>
   </body>

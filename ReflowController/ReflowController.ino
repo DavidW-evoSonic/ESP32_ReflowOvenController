@@ -237,6 +237,33 @@
 // ran the whole profile through to Complete without ever warming the oven.
 #define STEP_MISS_C         15.0f
 
+// A profile may not start from a warm chamber.
+//
+// Two reasons, and the second is the one that bites quietly. A hot oven is a
+// hazard to load -- reaching into it is how you get burnt, and the door has to
+// be open to do it. And step corridors rebase on the measured temperature at
+// step entry while their durations are absolute, so the same profile started
+// warm is a materially different thermal history: step 0 of the default
+// profile needs 0.81-1.05 degC/s from 25 degC but only 0.61-0.80 degC/s from
+// 60 degC, and that slower ramp spends far longer drying the flux out before
+// the board ever reaches liquidus. The second board of a batch would reflow
+// differently from the first with no fault raised anywhere.
+//
+// This bounds that variation rather than removing it -- see REWORK_NOTES 7.7.
+#define PROFILE_START_MAX_C   60
+
+// The door-open prompt waits for the coast to finish.
+//
+// A heating step ends when arrival is *projected*, which is deliberately while
+// the oven is still climbing and short of target -- the stored heat delivers
+// the rest. Beeping on that transition asks for the door at the exact moment
+// the coast is doing the work of reaching peak temperature, and an operator
+// standing ready would take 7 degC off the peak. So the prompt waits until the
+// climb has actually stopped and stayed stopped, with a cap so it cannot wait
+// for a peak that never comes.
+#define COOLDOWN_BEEP_SETTLE_MS    3000
+#define COOLDOWN_BEEP_MAX_WAIT_MS 60000
+
 // Power ceiling during a cooling step, as a level index.
 //
 // The corridor law can hold heat to stop a descent running away, which is what
@@ -361,6 +388,11 @@ float thermalLagSec = THERMAL_LAG_DEFAULT_S;
 int16_t measureTempC = MEASURE_TEMP_DEFAULT_C;
 // Result of the last measurement, 0 if none this power-up.
 float measuredLagSec = 0.0f;
+// Set when the oven has peaked and wants its door opened. The buzzer says so
+// too, but the operator may be at the browser rather than at the oven -- and
+// on this profile the difference between opening on the prompt and opening
+// nine seconds early is several degrees of peak.
+bool openDoorPrompt = false;
 
 float heaterSetpoint;
 float corridorLow;      // degC, coolest the oven may be right now
@@ -784,11 +816,13 @@ void setup() {
     snprintf(buffer,sizeof(buffer),
       "{\"time\": %lu, \"temp\": %.2f, \"dt\": %.2f, \"setpoint\": %.2f,"
       " \"low\": %.2f, \"high\": %.2f, \"power\": %.2f, \"step\": %d,"
-      " \"steps\": %d, \"lag\": %.1f, \"state\": \"%s\", \"fault\": \"%s\"}",
+      " \"steps\": %d, \"lag\": %.1f, \"openDoor\": %d,"
+      " \"state\": \"%s\", \"fault\": \"%s\"}",
       time, aktSystemTemperature, aktSystemTemperatureRamp, heaterSetpoint,
       corridorLow, corridorHigh,
       (float)powerHeater*100.0f/255.0f, activeStep, activeProfile.stepCount,
-      thermalLagSec, currentStateToString(), globalErrorText);
+      thermalLagSec, openDoorPrompt ? 1 : 0,
+      currentStateToString(), globalErrorText);
     server.send(200, "application/json", buffer);
   });
   // Slot directory for the profile picker: every slot, named or free.
@@ -821,23 +855,34 @@ void setup() {
     out += "]}, \"maxSteps\": " + String(MAX_STEPS) +
            ", \"oven\": {\"thermalLag\": " + String(thermalLagSec, 1) +
            ", \"measureTemp\": " + String(measureTempC) +
-           ", \"measuredLag\": " + String(measuredLagSec, 1) + "}}";
+           ", \"measuredLag\": " + String(measuredLagSec, 1) +
+           ", \"startMaxTemp\": " + String(PROFILE_START_MAX_C) + "}}";
     server.send(200, "application/json", out);
   });
   serverAction.on("/start", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
     serverAction.sendHeader("Access-Control-Allow-Origin","*");
-    if(currentState == Ready && !globalError)
+    if(currentState != Ready || globalError)
     {
-      //Start Reflow!
-      cycleStartTime = esp_timer_get_time();
-      currentState = Running;
-      serverAction.send(200, "text/plain", "OK");
+      serverAction.send(409, "text/plain", "Controller busy");
+      return;
     }
-    else
+    // A warm chamber is both a hazard to load and a different profile: see
+    // PROFILE_START_MAX_C. Let it cool rather than quietly running a slower
+    // ramp that dries the flux out.
+    if(aktSystemTemperature > PROFILE_START_MAX_C)
     {
-      serverAction.send(200, "text/plain", "ERROR");
+      char msg[96];
+      snprintf(msg, sizeof(msg),
+               "Chamber too hot to start: %.0fC, must be below %dC",
+               aktSystemTemperature, PROFILE_START_MAX_C);
+      serverAction.send(409, "text/plain", msg);
+      return;
     }
+    //Start Reflow!
+    cycleStartTime = esp_timer_get_time();
+    currentState = Running;
+    serverAction.send(200, "text/plain", "OK");
   });
   serverAction.on("/stop", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
@@ -940,16 +985,26 @@ void setup() {
   serverAction.on("/measurelag", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
     serverAction.sendHeader("Access-Control-Allow-Origin","*");
-    if(currentState == Ready && !globalError)
+    if(currentState != Ready || globalError)
     {
-      cycleStartTime = esp_timer_get_time();
-      currentState = MeasureLag;
-      serverAction.send(200, "text/plain", "OK");
+      serverAction.send(409, "text/plain", "Controller busy");
+      return;
     }
-    else
+    // Gated on the same limit as /start. The coast depends on how long the
+    // element has been driven, so measuring from a warm chamber measures
+    // something other than what a profile run will experience.
+    if(aktSystemTemperature > PROFILE_START_MAX_C)
     {
-      serverAction.send(409, "text/plain", "ERROR");
+      char msg[96];
+      snprintf(msg, sizeof(msg),
+               "Chamber too hot to measure: %.0fC, must be below %dC",
+               aktSystemTemperature, PROFILE_START_MAX_C);
+      serverAction.send(409, "text/plain", msg);
+      return;
     }
+    cycleStartTime = esp_timer_get_time();
+    currentState = MeasureLag;
+    serverAction.send(200, "text/plain", "OK");
   });
   serverAction.on("/factoryreset", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
@@ -1180,6 +1235,9 @@ void loop()
     static uint64_t stepStartedTime_ms = time_ms;
     static uint64_t lastLevelUpdate_ms  = time_ms;
     static bool     cooldownAnnounced   = false;
+    static bool     awaitingPeakBeep    = false;
+    static uint64_t coolStepEntered_ms  = 0;
+    static uint64_t notClimbingSince_ms = 0;
 
     if (currentState == Running)
     {
@@ -1191,6 +1249,7 @@ void loop()
         lastLevelUpdate_ms = time_ms;
         powerLevel         = 0;
         cooldownAnnounced  = false;
+        awaitingPeakBeep   = false;
       }
 
       const Step_t &step = activeProfile.steps[activeStep];
@@ -1373,13 +1432,38 @@ void loop()
           lastLevelUpdate_ms = time_ms;
 
           // First cooling step: the oven cannot cool itself, so ask for the
-          // door. The old firmware beeped on entering CoolDown for this.
+          // door -- but not yet. The coast is still carrying the oven up to
+          // peak temperature, and prompting now would have the operator open
+          // the door into it. Arm the prompt and let the peak arrive first.
           if (!cooldownAnnounced &&
               activeProfile.steps[activeStep].targetTemp < step.targetTemp)
           {
-            cooldownAnnounced = true;
-            beepcount = 3; // Beep! We need the door open!!!
+            cooldownAnnounced   = true;
+            awaitingPeakBeep    = true;
+            coolStepEntered_ms  = time_ms;
+            notClimbingSince_ms = 0;
           }
+        }
+      }
+
+      // The armed door prompt, released once the oven has actually peaked.
+      // Same test /measurelag uses: the climb has to have stopped and stayed
+      // stopped, so one noisy sample cannot release it early.
+      if (awaitingPeakBeep)
+      {
+        if (aktSystemTemperatureRamp > 0.0f) notClimbingSince_ms = 0;
+        else if (notClimbingSince_ms == 0)   notClimbingSince_ms = time_ms;
+
+        bool peaked = notClimbingSince_ms &&
+                      (time_ms - notClimbingSince_ms >= COOLDOWN_BEEP_SETTLE_MS);
+        bool waited = (time_ms - coolStepEntered_ms >= COOLDOWN_BEEP_MAX_WAIT_MS);
+
+        if (peaked || waited)
+        {
+          awaitingPeakBeep = false;
+          openDoorPrompt   = true;
+          beepcount        = 3; // Beep! We need the door open!!!
+          Serial.printf("Peak %.1fC reached, open the door\n", aktSystemTemperature);
         }
       }
 
@@ -1496,6 +1580,13 @@ void loop()
     {
       powerLevel  = 0;
       powerHeater = 0;
+    }
+
+    if (currentState != Running && currentState != Complete)
+    {
+      // The prompt is a per-cycle thing. Complete keeps it: the board is still
+      // hot and the door still wants to be open.
+      openDoorPrompt = false;
     }
 
     if (currentState != Running)
