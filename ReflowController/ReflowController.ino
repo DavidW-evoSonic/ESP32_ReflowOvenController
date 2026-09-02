@@ -76,11 +76,20 @@
 #define MAX_PROFILES  30
 #define PROFILE_NAME_LENGTH 11
 
+// Name of both the setup access point and the mDNS host, so the oven is
+// reachable at http://REFLOW_HOSTNAME.local/ once it has joined a network.
+#define REFLOW_HOSTNAME "ReflowController"
+// How long to hold the setup portal open before giving up and carrying on. The
+// oven must not sit in the portal forever: with no display there is nothing to
+// show that it is stuck there, and loop() has a relay and a sensor to service.
+#define WIFI_PORTAL_TIMEOUT_S 180
+
 //includes
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <WiFiManager.h>
 #include <Preferences.h>
 #include <SPI.h>
 #include <Ticker.h>
@@ -137,6 +146,7 @@ SPIClass RGBLED(VSPI);
 esp_adc_cal_characteristics_t adcChars;
 esp_timer_handle_t  RelayTimer;
 Preferences PREF;
+WiFiManager wm;
 
 WebServer server(80);
 WebServer serverAction(8080);
@@ -416,6 +426,10 @@ bool loadPID() {
 void factoryReset() {
   Serial.println("Factory reset");
 
+  // Also drop the WiFi credentials. With no display and no encoder this is the
+  // only way back to the setup portal if the oven is moved to a new network.
+  wm.resetSettings();
+
   PREF.clear(); 
 
   activeProfileId = 0;
@@ -467,10 +481,32 @@ void setup() {
   loadPID();
   
   //init Wifi:
-  WiFi.begin();            
+  // Provisioning used to be an encoder-driven network scan with an on-screen
+  // keyboard. Headless that is unreachable, so WiFiManager raises its own
+  // access point when it has no working credentials: join REFLOW_HOSTNAME and
+  // pick a network from the captive portal.
+  WiFi.mode(WIFI_STA);
+  wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
+  wm.setHostname(REFLOW_HOSTNAME);
+
+  if (wm.autoConnect(REFLOW_HOSTNAME)) {
+    Serial.println();
+    Serial.print("WiFi connected to: "); Serial.println(WiFi.SSID());
+    // With no display, serial and mDNS are the only ways to find the oven.
+    Serial.print("Web UI:  http://"); Serial.println(WiFi.localIP());
+    Serial.print("     or: http://" REFLOW_HOSTNAME ".local/");
+    Serial.println();
+  }
+  else {
+    Serial.println();
+    Serial.println("WiFi setup portal timed out -- no network.");
+    Serial.println("The oven cannot be controlled until it joins one:");
+    Serial.println("power cycle to reopen the portal at SSID " REFLOW_HOSTNAME);
+    Serial.println();
+  }
  
   //init Webserver
-  if (MDNS.begin("ReflowController")) {
+  if (MDNS.begin(REFLOW_HOSTNAME)) {
       Serial.println("MDNS responder started");
   }
   server.on("/", []() {
