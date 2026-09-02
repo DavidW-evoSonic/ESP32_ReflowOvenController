@@ -24,8 +24,10 @@
 // for heater duty), 27, 23, 22, 4, 33. Defaulting to 17.
 #define HEATER      17
 
-#define TEMP1_CS    18
-#define TEMP2_CS    19
+// AD595 analog output. Must be an ADC1 channel (32-39); ADC2 is unusable while
+// WiFi is active. 34 is input-only, which suits a sensor input.
+#define TEMP_ADC_GPIO   34
+#define TEMP_ADC_CH     ADC1_CHANNEL_6
 
 #define BUZZER      25
 
@@ -43,6 +45,40 @@
 #define READ_TEMP_INTERVAL_MS 100 
 #define READ_TEMP_AVERAGE_COUNT 10 
 
+// AD595 outputs 10 mV/degC, divided 1.5:1 in hardware before reaching the ADC
+// so that the reflow range lands mid-scale where the ESP32 ADC is most linear
+// (250degC -> 2.50V raw -> 1.67V at the pin) rather than against its ceiling.
+// The ADC is specified linear only to 2450mV, which at this ratio is ~367degC:
+// far more headroom than reflow needs.
+//
+// HARDWARE DEPENDENCY: this firmware assumes that divider is fitted. Without it
+// every reading comes out 1.5x high, which trips the TEMP_PLAUSIBLE_MAX_C fault
+// at 200degC real. That is the safe direction -- an over-reading sensor makes
+// the PID back off, never overheat -- but it will fault out rather than run, so
+// the symptom is a dead oven, not a damaged one.
+#define AD595_MV_PER_C        10.0f
+#define TEMP_DIVIDER_RATIO     1.5f
+#define TEMP_OVERSAMPLE         64
+// The MAX31855 reported open/short faults on its status bits. The AD595 has no
+// such channel, but an open thermocouple drives its output to the rail, so an
+// implausibly high reading stands in for the same fault.
+//
+// This threshold is coupled to TEMP_DIVIDER_RATIO and to the AD595 supply, so
+// it cannot be chosen independently of them. On a single-supply 5V AD595 the
+// output rails around 4V, which at 1.5:1 puts ~2.67V on the pin -- past the
+// 2450mV linear limit, so it reads compressed and lands somewhere near 390degC
+// rather than the 400 the arithmetic suggests. 300degC sits clear above any
+// real reflow reading and clear below a railed one, so it survives that
+// uncertainty. Confirm it by measuring the open-thermocouple output on the
+// bench; if the divider ratio or the AD595 supply changes, revisit this and the
+// peakTemp/soakTemp clamps in /profile/edit with it.
+#define TEMP_PLAUSIBLE_MAX_C   300.0f
+// IDF renamed the 11dB constant to DB_12 (same ~2.5x scaling, the old name was
+// just a rounding) and deprecated the old spelling. These are enum values, not
+// macros, so this cannot be probed with #ifdef -- it relies on the platform pin
+// in platformio.ini.
+#define TEMP_ADC_ATTEN ADC_ATTEN_DB_12
+
 #define RGB_LED_BRITHNESS_1TO255  125 
 #define IDLE_TEMP     50
 #define MAX_PROFILES  30
@@ -58,6 +94,8 @@
 #include <Preferences.h>
 #include <SPI.h>
 #include <Ticker.h>
+#include <driver/adc.h>
+#include <esp_adc_cal.h>
 
 #include "src/Adafruit_GFX_Library/Adafruit_GFX.h"
 #include "src/Adafruit-ST7735-Library/Adafruit_ST7735.h"
@@ -79,17 +117,6 @@ typedef struct profileValues_s {
   float  rampUpRate;
   float  rampDownRate;
 } Profile_t;
-
-typedef union {
-  uint32_t value;
-  uint8_t bytes[4];
-} __attribute__((packed)) MAX31855_t;
-
-typedef struct Thermocouple {
-  float temperature;
-  uint8_t stat;
-  uint8_t chipSelect;
-};
 
 typedef enum {
   None     = 0,
@@ -139,8 +166,7 @@ SPIClass RGBLED(VSPI);
 Adafruit_ST7735 tft = Adafruit_ST7735(&MYSPI,LCD_CS, LCD_DC, LCD_RESET);
 ClickEncoder Encoder(ENC1, ENC2, ENC_B, 2);
 hw_timer_t * encodertimer = NULL;
-Thermocouple Temp_1;
-Thermocouple Temp_2;
+esp_adc_cal_characteristics_t adcChars;
 Menu::Engine myMenue;
 esp_timer_handle_t  RelayTimer;
 Preferences PREF;
@@ -302,27 +328,22 @@ void setLEDRGBBColor(uint8_t r, uint8_t g, uint8_t b)
 }
 
 
-void readThermocouple(struct Thermocouple* input) {
-  MAX31855_t sensor;
-
-  uint8_t lcdState = digitalRead(LCD_CS);
-  digitalWrite(LCD_CS, HIGH);
-  MYSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(input->chipSelect, LOW);
-  delay(1);
-  
-  for (int8_t i = 3; i >= 0; i--) {
-    sensor.bytes[i] = MYSPI.transfer(0x00);
+// Reads the AD595 on ADC1, oversampled to knock down the ESP32 ADC's
+// considerable sample noise, and converted through the chip's factory eFuse
+// calibration rather than a nominal full-scale assumption.
+//
+// Returns degrees C. An open thermocouple drives the AD595 to the rail, which
+// shows up here as an implausibly high reading; the caller treats that as a
+// sensor fault.
+float readTemperature() {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < TEMP_OVERSAMPLE; i++) {
+    sum += adc1_get_raw(TEMP_ADC_CH);
   }
-  digitalWrite(input->chipSelect, HIGH);
-  MYSPI.endTransaction();
-  digitalWrite(LCD_CS, lcdState);
 
-  input->stat = sensor.bytes[0] & 0b111;
+  uint32_t mv = esp_adc_cal_raw_to_voltage(sum / TEMP_OVERSAMPLE, &adcChars);
 
-  uint16_t value = (sensor.value >> 18) & 0x3FFF; // mask off the sign bit and shit to the correct alignment for the temp data  
-  input->temperature = value * 0.25;
-
+  return (mv * TEMP_DIVIDER_RATIO) / AD595_MV_PER_C;
 }
 
 // Drives the mechanical relay with slow time-proportional control.
@@ -1349,10 +1370,12 @@ void setup() {
   timerAlarmEnable(encodertimer);
   
   //INIT Temps
-  pinMode(TEMP1_CS, OUTPUT);
-  pinMode(TEMP2_CS, OUTPUT);
-  Temp_1.chipSelect = TEMP1_CS;
-  Temp_2.chipSelect = TEMP2_CS;
+  // 12dB attenuation, specified linear to ~2450mV. With the 1.5:1 divider (see
+  // TEMP_DIVIDER_RATIO) that covers ~367degC, so the whole reflow range sits
+  // comfortably inside the linear region.
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(TEMP_ADC_CH, TEMP_ADC_ATTEN);
+  esp_adc_cal_characterize(ADC_UNIT_1, TEMP_ADC_ATTEN, ADC_WIDTH_BIT_12, 1100, &adcChars);
   
   //init relay output
   pinMode(HEATER, OUTPUT);
@@ -1533,46 +1556,30 @@ void loop()
   if(time_ms >= (lastreadTemp + READ_TEMP_INTERVAL_MS))
   {
     lastreadTemp+=READ_TEMP_INTERVAL_MS; //interval should be regularly
-    readThermocouple(&Temp_1);
-    //readThermocouple(&Temp_2);
-
+    float reading = readTemperature();
 
     static float average[READ_TEMP_AVERAGE_COUNT];
-    static uint8_t stats[READ_TEMP_AVERAGE_COUNT];
+    static bool  faulted[READ_TEMP_AVERAGE_COUNT];
     static uint8_t pointer =0;
 
-    average[pointer]=Temp_1.temperature;
-    stats[pointer]=Temp_1.stat;
+    average[pointer]=reading;
+    faulted[pointer]=(reading > TEMP_PLAUSIBLE_MAX_C);
     pointer=(pointer+1)%READ_TEMP_AVERAGE_COUNT;
 
     float sum =0;
-    uint8_t state_count=0;
-    uint8_t stat=0;
+    uint8_t fault_count=0;
     for (int i=0;i<READ_TEMP_AVERAGE_COUNT;i++)
     {
       sum +=average[i];
-      stat &=stats[i];
-      if (stats[i]) 
+      if (faulted[i])
       {
-        state_count++;
+        fault_count++;
       }
     }
-    
-    if (state_count>READ_TEMP_AVERAGE_COUNT/2) {
-        switch (stat) {
-          case 0b001:
-            reportError("Temp Sensor 1: Open Circuit");
-            break;
-          case 0b010:
-            reportError("Temp Sensor 1: GND Short");
-            break;
-          case 0b100:
-            reportError("Temp Sensor 1: VCC Short");
-            break;
-          default:
-            reportError("Temp Sensor 1: Multiple errors!");
-            break;
-        }
+
+    // Majority vote, as before: one noisy sample must not abort a reflow.
+    if (fault_count>READ_TEMP_AVERAGE_COUNT/2) {
+      reportError("Temp Sensor: Open Circuit or out of range");
     }
 
     aktSystemTemperature = sum/READ_TEMP_AVERAGE_COUNT;
