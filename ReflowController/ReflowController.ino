@@ -41,6 +41,19 @@
 #define RELAY_TICK_MS       50
 #define RELAY_MIN_ON_MS    500
 #define RELAY_MIN_OFF_MS   500
+// relayDriver() runs from a timer and loop() is the only thing that ever
+// lowers the demand, so a wedged loop() leaves the relay driving whatever it
+// was last told -- indefinitely, on a mains heater, unattended. The control
+// loop stamps a heartbeat every 100 ms; the relay refuses to close without a
+// fresh one.
+//
+// Two thresholds, because a transient stall and a dead loop() want different
+// answers. Holding off is free and self-healing, so it happens early. Latching
+// costs a power cycle, so it waits for evidence that nothing is coming back.
+// The oven barely moves in 5 s, and its own faults resume covering it the
+// moment loop() does.
+#define RELAY_HEARTBEAT_HOLD_MS   5000
+#define RELAY_HEARTBEAT_FAULT_MS 30000
 #define READ_TEMP_INTERVAL_MS 100 
 #define READ_TEMP_AVERAGE_COUNT 10 
 
@@ -169,6 +182,11 @@
 // fit under TEMP_PLAUSIBLE_MAX_C or the run ends in a sensor fault instead of
 // a number.
 #define MEASURE_TEMP_MAX_C      250
+// The coast has ended only once the climb has stopped and stayed stopped. A
+// single sample dipping to zero is ADC noise -- a known risk on this hardware
+// -- and taking it for the peak ends the measurement early and reports a lag
+// that is too short, which is the dangerous direction.
+#define MEASURE_PEAK_SETTLE_MS  3000
 // Give up if the oven never stops rising, or never gets going.
 #define MEASURE_COAST_TIMEOUT_S 180
 #define MEASURE_HEAT_TIMEOUT_S  900
@@ -283,6 +301,9 @@ const char * globalErrorText = "";
 
 // Heater demand, 0..255, consumed by relayDriver().
 volatile uint8_t  powerHeater=0;
+// Last time the control loop ran, ms. relayDriver() will not close the relay
+// without a recent one -- see RELAY_HEARTBEAT_HOLD_MS.
+volatile uint64_t controlHeartbeat_ms=0;
 
 float aktSystemTemperature;
 float aktSystemTemperatureRamp; //°C/s
@@ -408,6 +429,21 @@ void relayDriver()
   static uint32_t windowElapsed = RELAY_WINDOW_MS; // force a latch on first tick
   static uint32_t onTime = 0;
 
+  // Is loop() still alive? Nothing else can lower powerHeater, so without this
+  // a stall in the web server or the WiFi stack would leave the last demand
+  // driving the element for as long as the board stays powered.
+  uint64_t now_ms = esp_timer_get_time() / 1000;
+  uint64_t sinceHeartbeat = (controlHeartbeat_ms && now_ms > controlHeartbeat_ms)
+                            ? now_ms - controlHeartbeat_ms : 0;
+  bool heartbeatStale = (controlHeartbeat_ms == 0) ||
+                        (sinceHeartbeat > RELAY_HEARTBEAT_HOLD_MS);
+
+  if (sinceHeartbeat > RELAY_HEARTBEAT_FAULT_MS)
+  {
+    // Dispatched on the timer *task*, not in an ISR, so this is safe here.
+    reportError("Control loop stopped: heater held off");
+  }
+
   if (windowElapsed >= RELAY_WINDOW_MS)
   {
     windowElapsed = 0;
@@ -419,7 +455,8 @@ void relayDriver()
     if (onTime > RELAY_WINDOW_MS - RELAY_MIN_OFF_MS) onTime = RELAY_WINDOW_MS;
   }
 
-  digitalWrite(HEATER, (!globalError && windowElapsed < onTime) ? HIGH : LOW);
+  digitalWrite(HEATER,
+    (!globalError && !heartbeatStale && windowElapsed < onTime) ? HIGH : LOW);
   windowElapsed += RELAY_TICK_MS;
 }
 
@@ -1066,6 +1103,11 @@ void loop()
   {
     lastControlloopupdate+=100; 
 
+    // Tell relayDriver() we are still here. Stamped before the work rather
+    // than after, so a fault raised below still leaves a fresh heartbeat and
+    // reports as itself instead of as a dead control loop.
+    controlHeartbeat_ms = time_ms;
+
     static State previousState= None; // sentinel: never equals a real state
     boolean stateChanged=false;
     if (currentState != previousState)
@@ -1305,10 +1347,12 @@ void loop()
       static bool  coasting = false;
       static float cutTemp = 0.0f, cutRate = 0.0f, peakTemp = 0.0f;
       static uint64_t phaseStart_ms = time_ms;
+      static uint64_t fallingSince_ms = 0;
 
       if (stateChanged)
       {
-        coasting      = false;
+        coasting        = false;
+        fallingSince_ms = 0;
         phaseStart_ms = time_ms;
         peakTemp      = aktSystemTemperature;
         measuredLagSec = 0.0f;
@@ -1350,7 +1394,13 @@ void loop()
 
         if (aktSystemTemperature > peakTemp) peakTemp = aktSystemTemperature;
 
-        bool peaked  = (aktSystemTemperatureRamp <= 0.0f) &&
+        // Require the climb to have stopped and stayed stopped, so one noisy
+        // sample cannot be mistaken for the peak.
+        if (aktSystemTemperatureRamp > 0.0f) fallingSince_ms = 0;
+        else if (fallingSince_ms == 0)       fallingSince_ms = time_ms;
+
+        bool peaked  = fallingSince_ms &&
+                       (time_ms - fallingSince_ms >= MEASURE_PEAK_SETTLE_MS) &&
                        (time_ms - phaseStart_ms > 2000); // let the cut register
         bool gaveUp  = (time_ms - phaseStart_ms >
                         (uint64_t)MEASURE_COAST_TIMEOUT_S * 1000);
@@ -1384,6 +1434,14 @@ void loop()
     {
       powerLevel  = 0;
       powerHeater = 0;
+    }
+
+    if (currentState != Running)
+    {
+      // Nothing defines a corridor outside a profile run, and leaving the last
+      // one in place puts a stale band on the chart that looks like the oven
+      // is being held somewhere it is not.
+      corridorLow = corridorHigh = heaterSetpoint = aktSystemTemperature;
     }
   }
 
