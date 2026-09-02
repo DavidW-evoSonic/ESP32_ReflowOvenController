@@ -17,9 +17,12 @@
 #define ENC2        32
 #define ENC_B       33
 
-#define HEATER1     17 
-#define HEATER2     16 
-#define ZEROX       4
+// TODO: not yet decided -- change this one line when the hardware is fixed.
+// Must be non-strapping and output-capable. Note 25/26 (suggested in the rework
+// notes) are NOT available: they stay claimed by BUZZER and RGB_SDO. Freed by
+// this rework and safe to use: 17, 16 (the original heater pins, already routed
+// for heater duty), 27, 23, 22, 4, 33. Defaulting to 17.
+#define HEATER      17
 
 #define TEMP1_CS    18
 #define TEMP2_CS    19
@@ -30,8 +33,13 @@
 #define RGB_SDO     26
 
 //constance
-#define RECAL_ZEROX_TIME_MS 100 
-#define ZEROX_TIMEOUT_MS 5000      
+// Time-proportional relay output. A mechanical relay cannot be phase-fired, so
+// PID demand is expressed as on-time within a fixed window. The min on/off
+// clamps suppress pulses too short to be worth a contact cycle.
+#define RELAY_WINDOW_MS   4000
+#define RELAY_TICK_MS       50
+#define RELAY_MIN_ON_MS    500
+#define RELAY_MIN_OFF_MS   500
 #define READ_TEMP_INTERVAL_MS 100 
 #define READ_TEMP_AVERAGE_COUNT 10 
 
@@ -126,10 +134,6 @@ bool factoryReset(const Menu::Action_t);
 //Varables
 const char * ver = "4.0";
 
-//https://docs.google.com/spreadsheets/d/1syyYxHWjEHy5YJJYK1BmVZYog_yKRtXpa9yudWSkGAE/edit?usp=sharing
-//(ASIN(A3/256*2-1)+PI()/2)/PI()*256
-const uint8_t asinelookupTable[] {0,10,14,17,20,22,25,27,28,30,32,34,35,37,38,39,41,42,43,44,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,67,68,69,70,71,72,72,73,74,75,76,76,77,78,79,80,80,81,82,83,83,84,85,86,86,87,88,88,89,90,91,91,92,93,93,94,95,95,96,97,98,98,99,100,100,101,102,102,103,104,104,105,106,106,107,108,108,109,110,110,111,111,112,113,113,114,115,115,116,117,117,118,119,119,120,120,121,122,122,123,124,124,125,126,126,127,128,128,129,129,130,131,131,132,133,133,134,135,135,136,136,137,138,138,139,140,140,141,142,142,143,144,144,145,145,146,147,147,148,149,149,150,151,151,152,153,153,154,155,155,156,157,157,158,159,160,160,161,162,162,163,164,164,165,166,167,167,168,169,169,170,171,172,172,173,174,175,175,176,177,178,179,179,180,181,182,183,183,184,185,186,187,188,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,211,212,213,214,216,217,218,220,221,223,225,227,228,230,233,235,238,241,245};
-
 SPIClass MYSPI(HSPI); 
 SPIClass RGBLED(VSPI); 
 Adafruit_ST7735 tft = Adafruit_ST7735(&MYSPI,LCD_CS, LCD_DC, LCD_RESET);
@@ -138,8 +142,7 @@ hw_timer_t * encodertimer = NULL;
 Thermocouple Temp_1;
 Thermocouple Temp_2;
 Menu::Engine myMenue;
-portMUX_TYPE ZeroCrossingMutex = portMUX_INITIALIZER_UNLOCKED;
-esp_timer_handle_t  SwitchPowerTimer;
+esp_timer_handle_t  RelayTimer;
 Preferences PREF;
 
 WebServer server(80);
@@ -147,11 +150,7 @@ WebServer serverAction(8080);
 
 volatile boolean globalError=false;
 
-volatile uint8_t zeroCrossingTimesPointer=0;
-volatile uint64_t zeroCrossingTimes[32];
-volatile uint16_t zeroCrossingDuration=0;
-volatile uint16_t zeroCrossingPoint=0;
-
+// Heater demand, 0..255, consumed by relayDriver().
 volatile uint8_t  powerHeater=0;
 
 float aktSystemTemperature;
@@ -261,9 +260,8 @@ void reportError(char *text)
 {
   globalError=true;
 
-  //Turn off heaters
-  digitalWrite(HEATER1,LOW);
-  digitalWrite(HEATER2,LOW);
+  //Turn off heater
+  digitalWrite(HEATER,LOW);
   
   Serial.print("Report Error: ");
   Serial.println(text);
@@ -327,92 +325,31 @@ void readThermocouple(struct Thermocouple* input) {
 
 }
 
-void IRAM_ATTR zeroCrossingDetected()
+// Drives the mechanical relay with slow time-proportional control.
+//
+// Runs from a periodic esp_timer every RELAY_TICK_MS so it is unaffected by
+// anything that blocks loop(). The demand is latched once per window, so the
+// on-pulse stays contiguous even if powerHeater moves mid-window.
+void relayDriver()
 {
-  uint64_t time= esp_timer_get_time();
-  if(time>(zeroCrossingTimes[zeroCrossingTimesPointer]+100)) //filter multiple triggering < 100µs
+  static uint32_t windowElapsed = RELAY_WINDOW_MS; // force a latch on first tick
+  static uint32_t onTime = 0;
+
+  if (windowElapsed >= RELAY_WINDOW_MS)
   {
-    zeroCrossingTimesPointer = (zeroCrossingTimesPointer+1) & 0x1F;
-    zeroCrossingTimes[zeroCrossingTimesPointer]=time;
+    windowElapsed = 0;
+    onTime = ((uint32_t)powerHeater * RELAY_WINDOW_MS) / 255;
+
+    // Never ask the relay for a pulse (or a gap) too short to be worth a
+    // contact cycle: round it away to fully off or fully on.
+    if (onTime < RELAY_MIN_ON_MS) onTime = 0;
+    if (onTime > RELAY_WINDOW_MS - RELAY_MIN_OFF_MS) onTime = RELAY_WINDOW_MS;
   }
+
+  digitalWrite(HEATER, (!globalError && windowElapsed < onTime) ? HIGH : LOW);
+  windowElapsed += RELAY_TICK_MS;
 }
 
-void IRAM_ATTR switchPower()
-{
-  static boolean nextisinPhased= false;
-  static boolean nextIsZcross= false;
-  uint32_t delta=1000000;
-  //get zerro crossing Values    
-  portENTER_CRITICAL(&ZeroCrossingMutex);
-  uint16_t duration = zeroCrossingDuration;
-  uint16_t xpoint =zeroCrossingPoint;
-  portEXIT_CRITICAL(&ZeroCrossingMutex);        
-  uint8_t setvalue=powerHeater;
-  
-  digitalWrite(HEATER1,LOW);
-  digitalWrite(HEATER2,LOW);
-
-  if(!globalError)
-  {
-    if(nextIsZcross==true)
-    {
-      if(setvalue!=0)
-      {
-        delta =((uint32_t)duration*(256-setvalue))/256;
-        if(delta<500)
-        {
-          delta=500;          
-        }
-        if(delta>(duration-500))
-        {
-          delta=duration-500;          
-        }
-        nextisinPhased=true;        
-      }
-      else
-      {
-        delta=duration/2;
-      }
-      nextIsZcross=false;
-    }
-    else
-    {
-      if(nextisinPhased==true)
-      {
-        digitalWrite(HEATER1,HIGH);
-        digitalWrite(HEATER2,HIGH);
-        nextisinPhased=false;
-      }
-      if(duration>7000)
-      {
-        //synconice with Zerrocrossing
-        uint64_t time= esp_timer_get_time();
-        uint64_t nextcrossing= time - (time %duration);
-        nextcrossing += xpoint;
-        //200us befor ZCrossing to give the SSR time to turn off 
-        nextcrossing-=500;
-        //we are alwasy at least 500s awai from an crossing event!
-        if(nextcrossing<time+200) 
-        { 
-          nextcrossing += duration;
-        }
-        //delta > 100us to allwo the interrupt to work
-        if(nextcrossing-100>time)
-        {
-          delta=nextcrossing-time;
-        }
-        else
-        {
-          Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-          delta=100;          
-        }
-        nextIsZcross = true;    
-      }
-
-    }
-  }
-  esp_timer_start_once(SwitchPowerTimer,delta); 
-}
 
 void IRAM_ATTR encoderServices(void){
     Encoder.service();      
@@ -1417,21 +1354,15 @@ void setup() {
   Temp_1.chipSelect = TEMP1_CS;
   Temp_2.chipSelect = TEMP2_CS;
   
-  //init Zero crossing interrupt
-  pinMode(ZEROX, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ZEROX), zeroCrossingDetected, CHANGE);
-  
-  //init switchPower
-  pinMode(HEATER1, OUTPUT);
-  digitalWrite(HEATER1,LOW);
-  pinMode(HEATER2, OUTPUT);
-  digitalWrite(HEATER2,LOW);
+  //init relay output
+  pinMode(HEATER, OUTPUT);
+  digitalWrite(HEATER,LOW);
   esp_timer_create_args_t _timerConfig;
-  _timerConfig.callback = (void (*)(void*))switchPower;
+  _timerConfig.callback = (void (*)(void*))relayDriver;
   _timerConfig.dispatch_method = ESP_TIMER_TASK;
-  _timerConfig.name = "switchPower";
-  esp_timer_create(&_timerConfig, &SwitchPowerTimer);
-  esp_timer_start_once(SwitchPowerTimer, 1000000); //start in 1 secound!
+  _timerConfig.name = "relayDriver";
+  esp_timer_create(&_timerConfig, &RelayTimer);
+  esp_timer_start_periodic(RelayTimer, RELAY_TICK_MS * 1000);
 
   //beep
   pinMode(BUZZER,OUTPUT);
@@ -1557,8 +1488,6 @@ void displayMenusInfos()
 void loop()
 {
   uint64_t time_ms = esp_timer_get_time()/1000;
-  static uint64_t lastrecalczerrox=time_ms;
-  static uint64_t lastzeroCrossingCalc=time_ms;
   static uint64_t lastbeep=time_ms;
   static uint64_t lastreadTemp=time_ms;
   static uint64_t lastRGBupdate=time_ms;
@@ -1573,102 +1502,6 @@ void loop()
   //
   server.handleClient();  
   serverAction.handleClient();  
-
-  // --------------------------------------------------------------------------
-  // Calc new Zero crossing time point
-  //
-  if(time_ms >= (lastrecalczerrox + RECAL_ZEROX_TIME_MS))
-  {
-    lastrecalczerrox = time_ms;
-    boolean error=false;
-    uint8_t pointer = zeroCrossingTimesPointer;
-
-    //look at the last 10 crossings 
-    pointer = (pointer - 20) & 0x1F; 
-
-    if(zeroCrossingTimes[pointer] < (esp_timer_get_time()-10*11*1000))
-    {
-      error=true;
-      #ifndef NOEDGEERRORREPORT
-        Serial.println("No Edge detection!");        
-      #endif
-    }
-    if(error==false)
-    {  
-      if((zeroCrossingTimes[(pointer+1)&0x1F] - zeroCrossingTimes[pointer]) > 5000) //syn
-      {
-        pointer = (pointer - 1) & 0x1F;
-      }
-      for (uint8_t i=0; i<19;i++)
-      {
-        uint32_t delta = zeroCrossingTimes[(pointer+i+1)&0x1F] - zeroCrossingTimes[(pointer+i)&0x1F];
-        if(((delta>5000) && (i%2!=1)) || ((delta<5000) && (i%2!=0)))
-        {
-          error=true;
-          Serial.println("Mssing Edge detection!");
-          break;
-        }    
-      }
-      if(error==false)
-      {
-        //calc average duration:
-        uint32_t duration=(zeroCrossingTimes[(pointer+19)&0x1F]-zeroCrossingTimes[(pointer-1)&0x1F])/10;
-        if(duration>11000 || duration<7000) 
-        {
-          error=true;
-          Serial.println("Duration not OK! Missing edges?");
-        }
-        if(error==false)
-        {
-          //calc zero crossing point:
-          uint32_t xpoint=0;
-          for (uint8_t i=0; i<20;i+=2)
-          {
-            uint64_t a = zeroCrossingTimes[(pointer+i)&0x1F];
-            uint64_t b = zeroCrossingTimes[(pointer+i+1)&0x1F];
-            xpoint+=((a+b)/2)%duration;
-            
-          }      
-          xpoint=xpoint/10;
-          for (uint8_t i=0; i<20;i+=2)
-          {
-            int64_t a = zeroCrossingTimes[(pointer+i)&0x1F];
-            int64_t b = zeroCrossingTimes[(pointer+i+1)&0x1F];
-            if(abs((((a+b)/2)%duration)-xpoint)>200) //200us jitter is ok
-            {
-              error=true;
-              Serial.println("Edgededection jitter to HIGH!");
-              break;
-            }
-          }     
-          if(error==false){
-            lastzeroCrossingCalc=time_ms;
-            portENTER_CRITICAL(&ZeroCrossingMutex);
-            zeroCrossingDuration=duration;
-            zeroCrossingPoint=xpoint;
-            portEXIT_CRITICAL(&ZeroCrossingMutex);
-
-            /*
-            Serial.print(" ");
-            for(int i = 0; i < (duration%10) ; i++)
-              Serial.print("\t");
-            Serial.println(xpoint);
-            */
-          }
-        }          
-      }
-    }        
-  }
-
-  // --------------------------------------------------------------------------
-  // Report Zero Crossing error
-  //
-  if(time_ms >= (lastzeroCrossingCalc + ZEROX_TIMEOUT_MS))
-  {
-    #ifndef NOEDGEERRORREPORT
-      reportError("Zero Crossing Detection Timeout!");
-    #endif
-  }
 
   // --------------------------------------------------------------------------
   // Do the beep if needed
@@ -2048,8 +1881,7 @@ void loop()
       {
         reportError("Temperature is Way to HOT!!!!!"); 
       }
-      //make it more linear!
-      powerHeater = asinelookupTable[(uint8_t)heaterOutput]; 
+      powerHeater = (uint8_t)heaterOutput;
     } 
     else if(currentState == Edit && myMenue.currentItem==&miManual)
     {

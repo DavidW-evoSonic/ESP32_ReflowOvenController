@@ -35,3 +35,6 @@ eagle.epf
 
 *.eps
 
+
+# PlatformIO
+.pio/
