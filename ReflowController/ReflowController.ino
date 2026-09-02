@@ -445,6 +445,37 @@ void loadLastUsedProfile() {
   loadParameters(activeProfileId);
 }
 
+// Applies a query argument only if the request actually carried it, so a form
+// can submit one field without blanking the rest.
+static bool argInt16(WebServer &srv, const char *name, int16_t *out, int16_t lo, int16_t hi) {
+  if (!srv.hasArg(name)) return false;
+  long v = srv.arg(name).toInt();
+  if (v < lo) v = lo;
+  if (v > hi) v = hi;
+  *out = (int16_t)v;
+  return true;
+}
+
+static bool argFloat(WebServer &srv, const char *name, float *out, float lo, float hi) {
+  if (!srv.hasArg(name)) return false;
+  float v = srv.arg(name).toFloat();
+  if (v < lo) v = lo;
+  if (v > hi) v = hi;
+  *out = v;
+  return true;
+}
+
+// Escapes the few characters that would otherwise break out of a JSON string.
+// Profile names are user-supplied and go straight into /profiles output.
+static String jsonEscape(const char *in) {
+  String out;
+  for (const char *c = in; *c; c++) {
+    if (*c == '"' || *c == '\\') { out += '\\'; out += *c; }
+    else if (*c >= 0x20)           { out += *c; }
+  }
+  return out;
+}
+
 void setup() {
   //Debug
   Serial.begin(115200);
@@ -518,6 +549,36 @@ void setup() {
     char buffer[320];
     unsigned long time = (esp_timer_get_time()-cycleStartTime)/1000;
     snprintf(buffer,320,"{\"time\": %lu, \"temp\": %.2f, \"dt\": %.2f, \"setpoint\":  %.2f, \"power\": %.2f, \"state\": \"%s\", \"fault\": \"%s\"}",time,aktSystemTemperature,aktSystemTemperatureRamp,heaterSetpoint,heaterOutput*100/256,currentStateToString(),globalErrorText);
+    server.send(200, "application/json", buffer);
+  });
+  // Slot directory for the profile picker: every slot, named or free.
+  server.on("/profiles", []() {
+    server.sendHeader("Cache-Control","no-cache");
+    String out = "{\"active\": " + String(activeProfileId) + ", \"profiles\": [";
+    for (uint8_t i = 0; i <= MAX_PROFILES; i++) {
+      char name[PROFILE_NAME_LENGTH];
+      loadProfileName(i, name);
+      if (i) out += ",";
+      out += "{\"id\": " + String(i) + ", \"name\": \"" + jsonEscape(name) + "\"}";
+    }
+    out += "]}";
+    server.send(200, "application/json", out);
+  });
+  // Everything the menu used to let you edit, in one document.
+  server.on("/config", []() {
+    server.sendHeader("Cache-Control","no-cache");
+    char buffer[512];
+    snprintf(buffer, sizeof(buffer),
+      "{\"profile\": {\"id\": %d, \"name\": \"%s\", \"soakTemp\": %d, \"soakDuration\": %d,"
+      " \"peakTemp\": %d, \"peakDuration\": %d, \"rampUpRate\": %.2f, \"rampDownRate\": %.2f},"
+      " \"pid\": {\"kp\": %.2f, \"ki\": %.2f, \"kd\": %.2f},"
+      " \"tuning\": {\"output\": %d, \"noiseBand\": %d, \"step\": %d, \"lookback\": %d}}",
+      activeProfileId, jsonEscape(activeProfile.name).c_str(),
+      activeProfile.soakTemp, activeProfile.soakDuration,
+      activeProfile.peakTemp, activeProfile.peakDuration,
+      activeProfile.rampUpRate, activeProfile.rampDownRate,
+      heaterPID.Kp, heaterPID.Ki, heaterPID.Kd,
+      tuningHeaterOutput, tuningNoiseBand, tuningOutputStep, tuningLookbackSec);
     server.send(200, "application/json", buffer);
   });
   serverAction.on("/start", []() {
@@ -627,6 +688,58 @@ void setup() {
       return;
     }
     factoryReset();
+    serverAction.send(200, "text/plain", "OK");
+  });
+  // Edits the in-memory profile. Not persisted until /profile/save, matching
+  // how the menu behaved: edit freely, then choose a slot to write to.
+  serverAction.on("/profile/edit", []() {
+    serverAction.sendHeader("Cache-Control","no-cache");
+    serverAction.sendHeader("Access-Control-Allow-Origin","*");
+    if(currentState != Ready)
+    {
+      serverAction.send(409, "text/plain", "ERROR");
+      return;
+    }
+    if(serverAction.hasArg("name"))
+    {
+      snprintf(activeProfile.name, PROFILE_NAME_LENGTH, "%s", serverAction.arg("name").c_str());
+    }
+    argInt16(serverAction, "soakTemp",     &activeProfile.soakTemp,     0, 280);
+    argInt16(serverAction, "soakDuration", &activeProfile.soakDuration, 0, 999);
+    // Kept below TEMP_PLAUSIBLE_MAX_C: a profile must not be able to ask for a
+    // temperature that would trip the sensor fault on the way to reaching it.
+    argInt16(serverAction, "peakTemp",     &activeProfile.peakTemp,     0, 280);
+    argInt16(serverAction, "peakDuration", &activeProfile.peakDuration, 0, 999);
+    argFloat(serverAction, "rampUpRate",   &activeProfile.rampUpRate,   0.1f, 10.0f);
+    argFloat(serverAction, "rampDownRate", &activeProfile.rampDownRate, 0.1f, 10.0f);
+    serverAction.send(200, "text/plain", "OK");
+  });
+  serverAction.on("/pid", []() {
+    serverAction.sendHeader("Cache-Control","no-cache");
+    serverAction.sendHeader("Access-Control-Allow-Origin","*");
+    if(currentState != Ready)
+    {
+      serverAction.send(409, "text/plain", "ERROR");
+      return;
+    }
+    argFloat(serverAction, "kp", &heaterPID.Kp, 0.0f, 1000.0f);
+    argFloat(serverAction, "ki", &heaterPID.Ki, 0.0f, 1000.0f);
+    argFloat(serverAction, "kd", &heaterPID.Kd, 0.0f, 1000.0f);
+    savePID();
+    serverAction.send(200, "text/plain", "OK");
+  });
+  serverAction.on("/tuning", []() {
+    serverAction.sendHeader("Cache-Control","no-cache");
+    serverAction.sendHeader("Access-Control-Allow-Origin","*");
+    if(currentState != Ready)
+    {
+      serverAction.send(409, "text/plain", "ERROR");
+      return;
+    }
+    argInt16(serverAction, "output",    &tuningHeaterOutput, 1, 100);
+    argInt16(serverAction, "noiseBand", &tuningNoiseBand,    1, 50);
+    argInt16(serverAction, "step",      &tuningOutputStep,   1, 100);
+    argInt16(serverAction, "lookback",  &tuningLookbackSec,  1, 600);
     serverAction.send(200, "text/plain", "OK");
   });
   server.onNotFound([](){
