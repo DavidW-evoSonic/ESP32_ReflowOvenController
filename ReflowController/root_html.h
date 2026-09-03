@@ -291,6 +291,9 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                 $('#o_thermalLag').val(c.oven.thermalLag);
                 $('#o_measureTemp').val(c.oven.measureTemp);
                 startMax = c.oven.startMaxTemp;
+                // Never the password itself, only whether one is set.
+                $('#ota_none').toggle(!c.otaSet);
+                $('#ota_have').toggle(!!c.otaSet);
                 $('#o_measured').text(c.oven.measuredLag > 0
                     ? "last measured: "+c.oven.measuredLag+" s"
                     : "not measured this power-up");
@@ -335,6 +338,55 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             if(confirm("Factory reset? This erases all profiles and the WiFi credentials."))
                 act("factoryreset").done(loadConfig);
         });
+        // HTTP basic auth, assembled here rather than letting the browser
+        // prompt: the password lives in a field on this panel, and a native
+        // 401 dialog mid-upload is a worse experience than a refusal.
+        function otaAuth(pass){ return "Basic " + btoa("ota:" + pass); }
+
+        $('#ota_set').click(function(){
+            act("otapass", {pass: $('#ota_new').val()}).done(function(){
+                $('#ota_new').val("");
+                loadConfig();
+            });
+        });
+        $('#ota_change').click(function(){
+            act("otapass", {old: $('#ota_old').val(),
+                            pass: $('#ota_new2').val()}).done(function(){
+                $('#ota_old').val(""); $('#ota_new2').val("");
+                alert("OTA password changed.");
+            });
+        });
+        $('#ota_upload').click(function(){
+            var f = $('#ota_file')[0].files[0];
+            if(!f){ alert("Choose a firmware .bin first."); return; }
+            var pass = $('#ota_pass').val();
+            if(!pass){ alert("Enter the OTA password."); return; }
+            if(!confirm("Replace the firmware with "+f.name+" ("
+                        +Math.round(f.size/1024)+" KB)?\n\n"
+                        +"The oven reboots on success."))
+                return;
+            var fd = new FormData();
+            fd.append("firmware", f, f.name);
+            // Same-origin POST to port 80, unlike every other mutation here:
+            // a cross-origin upload carrying an Authorization header needs
+            // CORS credentials, and there is no reason to invite that.
+            var xhr = new XMLHttpRequest();
+            xhr.open("POST", "/update", true);
+            xhr.setRequestHeader("Authorization", otaAuth(pass));
+            xhr.upload.onprogress = function(e){
+                if(e.lengthComputable)
+                    $('#ota_stat').text(Math.round(100*e.loaded/e.total)+"%");
+            };
+            xhr.onload = function(){
+                $('#ota_stat').text(xhr.responseText || ("HTTP "+xhr.status));
+            };
+            // The board reboots the moment it has answered, so a dropped
+            // connection after a 200 is success, not failure.
+            xhr.onerror = function(){ $('#ota_stat').text("Upload failed"); };
+            $('#ota_stat').text("uploading\u2026");
+            xhr.send(fd);
+        });
+
         $('#toggle').click(function(){ $('#panel').toggle(); });
 
         $('#action').click(function () {
@@ -434,6 +486,28 @@ const char ROOT_HTML[] PROGMEM = R"=====(
           <fieldset><legend>Manual heating</legend>
             <label>Power (%) <input id="manual_power" type="number" value="0" size="4"></label>
             <button id="manual_set">Set</button>
+          </fieldset>
+
+          <fieldset><legend>Firmware (OTA)</legend>
+            <div id="ota_none">
+              <label>Set OTA password <input id="ota_new" type="password" size="14"></label>
+              <button id="ota_set">Set</button><br>
+              <span>OTA is refused until a password is set. Set it once, on a
+                network you trust &mdash; the first set cannot be
+                authenticated.</span>
+            </div>
+            <div id="ota_have" style="display:none">
+              <label>Password <input id="ota_pass" type="password" size="14"></label>
+              <input id="ota_file" type="file" accept=".bin">
+              <button id="ota_upload">Upload firmware</button>
+              <span id="ota_stat"></span><br>
+              <label>Change: current <input id="ota_old" type="password" size="10"></label>
+              <label>new <input id="ota_new2" type="password" size="10"></label>
+              <button id="ota_change">Change</button><br>
+              <span>Refused while a cycle is running or the oven is heating
+                manually. The oven reboots into the new firmware on
+                success.</span>
+            </div>
           </fieldset>
 
           <fieldset><legend>Danger</legend>

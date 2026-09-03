@@ -380,6 +380,20 @@
 
 // Name of both the setup access point and the mDNS host, so the oven is
 // reachable at http://REFLOW_HOSTNAME.local/ once it has joined a network.
+// Over-the-air firmware update.
+//
+// The default partition table already carries a second 1.25 MiB app slot and
+// the otadata selector, so nothing here needs a repartition -- OTA space was
+// always allocated, just never used.
+//
+// Fixed HTTP basic-auth username; only the password is configurable. There is
+// no value in making both secret, and one field is one less thing to mistype
+// into an oven you cannot see.
+#define OTA_USER            "ota"
+// Short enough not to be a nuisance, long enough not to be walked in a few
+// thousand requests over a LAN.
+#define OTA_PASS_MIN_LEN    8
+
 #define REFLOW_HOSTNAME "ReflowController"
 // How long to hold the setup portal open before giving up and carrying on. The
 // oven must not sit in the portal forever: with no display there is nothing to
@@ -393,6 +407,7 @@
 #include <ESPmDNS.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <SPI.h>
 #include <Ticker.h>
 #include <driver/adc.h>
@@ -489,6 +504,14 @@ SPIClass RGBLED(VSPI);
 esp_adc_cal_characteristics_t adcChars;
 esp_timer_handle_t  RelayTimer;
 Preferences PREF;
+// OTA password, persisted. Empty means OTA is refused outright: an
+// unauthenticated firmware endpoint on a mains heater is not a default worth
+// shipping, and "off until configured" is the only safe starting position.
+String otaPassword = "";
+// Why the in-flight upload was refused, or nullptr. Set by the upload
+// callback and read by the completion handler, because those are two separate
+// invocations of two separate lambdas over one request.
+const char *otaReject = nullptr;
 WiFiManager wm;
 
 WebServer server(80);
@@ -612,6 +635,27 @@ void reportError(const char *text)
 
   Serial.print("Report Error: ");
   Serial.println(text);
+}
+
+// Why an OTA must be refused right now, or nullptr if it may proceed.
+//
+// Ready and Complete are the only states with the element guaranteed idle.
+// Manual is emphatically not one of them -- its entire purpose is to drive the
+// heater from the web UI -- and because Manual sits *below* ProcessStart, the
+// usual `currentState > ProcessStart` busy test would wave it straight
+// through. Hence naming the two permitted states rather than excluding the
+// active ones.
+//
+// A latched fault now lands in Complete with the relay held off, so a faulted
+// oven can still be updated. That is deliberate: a firmware bug is one of the
+// things you might be trying to fix.
+const char *otaBlockedReason()
+{
+  if (otaPassword.length() == 0)
+    return "OTA disabled: set a password first";
+  if (currentState != Ready && currentState != Complete)
+    return "Oven busy: stop the cycle before updating firmware";
+  return nullptr;
 }
 
 void setLEDRGBBColor(uint8_t r, uint8_t g, uint8_t b)
@@ -918,6 +962,9 @@ void factoryReset() {
   wm.resetSettings();
 
   PREF.clear(); 
+  // PREF.clear() takes the stored copy; this takes the live one, which would
+  // otherwise keep working until the next boot.
+  otaPassword = "";
 
   activeProfileId = 0;
   makeDefaultProfile();
@@ -1000,6 +1047,7 @@ void setup() {
   
   //Preferences init
   PREF.begin("REFLOW");
+  otaPassword = PREF.getString("otapw", "");
   loadLastUsedProfile();
   loadOven();
   
@@ -1070,6 +1118,87 @@ void setup() {
   // Everything the menu used to let you edit, in one document.
   // Everything the menu used to let you edit, in one document. The PID gains
   // and autotune parameters that used to live here are gone with the PID.
+  // Firmware upload. On the page's own server, not the action server on 8080,
+  // so the POST is same-origin: no preflight, and the Authorization header
+  // rides along without CORS having to be talked into allowing credentials.
+  //
+  // Note what deliberately does NOT happen during an upload: the control loop
+  // stops being serviced, so the relay heartbeat goes stale and relayDriver()
+  // holds the contact open within RELAY_HEARTBEAT_HOLD_MS. That is the correct
+  // behaviour and is left alone -- the element must not be driven while the
+  // firmware driving it is being replaced.
+  server.on("/update", HTTP_POST,
+    []() {   // request complete
+      if (otaReject)
+      {
+        server.send(409, "text/plain", otaReject);
+        otaReject = nullptr;
+        return;
+      }
+      if (Update.hasError())
+      {
+        server.send(500, "text/plain", Update.errorString());
+        return;
+      }
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/plain", "OK -- rebooting into the new firmware");
+      Serial.println("OTA complete, restarting");
+      delay(200);
+      ESP.restart();
+    },
+    []() {   // one call per chunk, plus a START and an END
+      HTTPUpload &up = server.upload();
+
+      if (up.status == UPLOAD_FILE_START)
+      {
+        otaReject = nullptr;
+
+        // Both gates belong HERE and not in the completion handler above.
+        // This callback runs first and writes flash as it goes, so a check
+        // deferred to completion would refuse the request only after the
+        // running firmware had already been overwritten.
+        //
+        // Order matters too: the blocked-reason test covers the no-password
+        // case, and it has to run before authenticate(), which would happily
+        // match an empty password against a client sending "ota:".
+        const char *why = otaBlockedReason();
+        if (why) { otaReject = why; return; }
+
+        if (!server.authenticate(OTA_USER, otaPassword.c_str()))
+        {
+          otaReject = "Bad OTA password";
+          Serial.println("OTA refused: bad password");
+          return;
+        }
+
+        Serial.printf("OTA start: %s\n", up.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+        {
+          otaReject = Update.errorString();
+          return;
+        }
+      }
+      else if (up.status == UPLOAD_FILE_WRITE)
+      {
+        if (otaReject) return;   // still drained by the parser, just not written
+        if (Update.write(up.buf, up.currentSize) != up.currentSize)
+        {
+          otaReject = Update.errorString();
+          Update.abort();
+        }
+      }
+      else if (up.status == UPLOAD_FILE_END)
+      {
+        if (otaReject) { Update.abort(); return; }
+        if (!Update.end(true)) otaReject = Update.errorString();
+      }
+      else if (up.status == UPLOAD_FILE_ABORTED)
+      {
+        Update.abort();
+        otaReject = "Upload aborted";
+      }
+    });
+
   server.on("/config", []() {
     server.sendHeader("Cache-Control","no-cache");
     String out = "{\"profile\": {\"id\": " + String(activeProfileId) +
@@ -1090,7 +1219,8 @@ void setup() {
            ", \"oven\": {\"thermalLag\": " + String(thermalLagSec, 1) +
            ", \"measureTemp\": " + String(measureTempC) +
            ", \"measuredLag\": " + String(measuredLagSec, 1) +
-           ", \"startMaxTemp\": " + String(PROFILE_START_MAX_C) + "}}";
+           ", \"startMaxTemp\": " + String(PROFILE_START_MAX_C) +
+           "}, \"otaSet\": " + String(otaPassword.length() ? 1 : 0) + "}";
     server.send(200, "application/json", out);
   });
   serverAction.on("/start", []() {
@@ -1147,6 +1277,38 @@ void setup() {
   // These replace menu items that the display rework removed. Without them
   // manual heating, profile switching and factory reset would have no trigger
   // at all. Richer profile editing follows on the main server.
+  // Set or change the OTA password.
+  //
+  // Changing an existing one requires the current one. The very first set
+  // cannot be authenticated -- there is nothing yet to authenticate against --
+  // so do it once, deliberately, on a network you trust. Until then OTA is
+  // refused outright, which is the safe direction for the failure.
+  serverAction.on("/otapass", []() {
+    serverAction.sendHeader("Cache-Control","no-cache");
+    serverAction.sendHeader("Access-Control-Allow-Origin","*");
+
+    if (otaPassword.length() > 0 && serverAction.arg("old") != otaPassword)
+    {
+      serverAction.send(403, "text/plain", "Wrong current password");
+      return;
+    }
+
+    String next = serverAction.arg("pass");
+    if (next.length() < OTA_PASS_MIN_LEN)
+    {
+      char msg[64];
+      snprintf(msg, sizeof(msg), "Password must be at least %d characters",
+               OTA_PASS_MIN_LEN);
+      serverAction.send(400, "text/plain", msg);
+      return;
+    }
+
+    otaPassword = next;
+    PREF.putString("otapw", otaPassword);
+    Serial.println("OTA password set");
+    serverAction.send(200, "text/plain", "OK");
+  });
+
   serverAction.on("/manual", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
     serverAction.sendHeader("Access-Control-Allow-Origin","*");
