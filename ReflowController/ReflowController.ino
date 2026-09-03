@@ -300,6 +300,29 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 // the step advanced in silence, with the deficit rebased into the next step at
 // step entry -- no fault, and a log that looks perfect (REWORK_NOTES 7.7).
 
+// Dead-element watchdog: heat demanded, nothing happening.
+//
+// The STEP_MISS_C check below only fires at maxDuration, which on the default
+// rate-bounded step 0 is 130/0.72 = 181 s. Three minutes of a commanded-on
+// mains relay before anyone is told is far too long to find out the element,
+// the relay or the wiring is dead -- and it is the most likely single fault in
+// the whole machine.
+//
+// So: while the controller is asking for real power on a heating step, the
+// oven has to actually respond. Any working oven at half power moves several
+// degrees in half a minute; the default profile's own slow bound is
+// 0.72 degC/s, which is 21 degC in that window. Requiring 2 degC is ~10x
+// slack, and the readout's noise over 30 s is under 0.1 degC, so there is no
+// plausible false positive between the two.
+//
+// Gated on demand, not on measured rise alone, because a step legitimately
+// sits flat when it is at temperature -- the clamp cuts power on approach and
+// a dwell holds. Only "asking for heat and getting none" is a fault.
+#define HEAT_STALL_WINDOW_MS   30000
+#define HEAT_STALL_MIN_RISE_C      2.0f
+// Half of full demand, rounded down. At POWER_LEVELS 5 that is level 2 of 4.
+#define HEAT_STALL_MIN_LEVEL   ((POWER_LEVELS - 1) / 2)
+
 // Extension is for the "nearly made it" case only.
 //
 // A step still more than STEP_MISS_C short when its slow bound expires is not
@@ -1732,6 +1755,8 @@ void loop()
     // not just during an extension, so the eligibility decision at maxDuration
     // already has a full window of history behind it rather than needing a
     // separate and weaker entry test.
+    static uint64_t heatStallRef_ms     = 0;
+    static float    heatStallRefTemp    = 0.0f;
     static uint64_t stepGainRef_ms      = 0;
     static float    stepGainRefTemp     = 0.0f;
     static float    stepExtendStart_s   = 0.0f;  // elapsed_s when it began
@@ -2116,6 +2141,37 @@ void loop()
       if (aktSystemTemperature > corridorHigh + CORRIDOR_ABORT_C)
       {
         reportError("Temperature is Way to HOT!!!!!");
+      }
+
+      // The opposite fault, and the one that actually happens: heat demanded
+      // and nothing coming back. See HEAT_STALL_WINDOW_MS.
+      //
+      // The window restarts whenever demand drops below the threshold, so it
+      // only ever measures a stretch of sustained heating -- the approach
+      // clamp dropping to zero on arrival resets it rather than accumulating
+      // toward a fault.
+      if (dir > 0.0f && !isDwell && powerLevel >= HEAT_STALL_MIN_LEVEL)
+      {
+        if (heatStallRef_ms == 0)
+        {
+          heatStallRef_ms  = time_ms;
+          heatStallRefTemp = aktSystemTemperature;
+        }
+        else if (time_ms - heatStallRef_ms >= HEAT_STALL_WINDOW_MS)
+        {
+          if (aktSystemTemperature - heatStallRefTemp < HEAT_STALL_MIN_RISE_C)
+          {
+            reportError("Oven not heating: no rise under power");
+          }
+          // Roll the window either way, so a recovered oven is not judged on
+          // history and a still-dead one re-reports on the next window.
+          heatStallRef_ms  = time_ms;
+          heatStallRefTemp = aktSystemTemperature;
+        }
+      }
+      else
+      {
+        heatStallRef_ms = 0;
       }
 
       powerHeater = (uint16_t)powerLevel * 255 / (POWER_LEVELS - 1);
