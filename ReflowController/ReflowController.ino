@@ -407,6 +407,69 @@ static_assert(ONTIME_FOR_LEVEL(POWER_LEVELS - 2)
 // COOLDOWN_BEEP_SETTLE_MS and MEASURE_PEAK_SETTLE_MS.
 #define CORRIDOR_ABORT_SETTLE_MS 3000
 
+// Hold a fixed temperature, for comparing the oven's probe against a
+// reference meter at several levels.
+//
+// This is a MEASUREMENT mode, not a reflow mode. What a cross-calibration
+// needs is for the oven to sit still while two instruments are read; it does
+// NOT need the reading to equal the setpoint, because any steady-state offset
+// is common to both instruments and cancels when they are read together. That
+// is why this reuses the corridor law rather than introducing a PID: the
+// error a PID exists to remove is the one term that does not matter here, and
+// gains would be a new thing to tune in a controller whose whole point is
+// that there is nothing to tune.
+//
+// What actually bounds how still the oven sits is POWER_LEVELS: 12.5% of a
+// 4 s window is the finest demand the relay can express, and no control law
+// beats its own actuator resolution. Expect a slow cycle about the setpoint
+// and read both instruments together rather than trying to remove it.
+#define HOLD_TEMP_MIN_C     40
+#define HOLD_TEMP_MAX_C    250
+
+// The element runs unattended here, with no profile to end the cycle. A hold
+// that is walked away from has to stop on its own.
+#define HOLD_TIMEOUT_S    3600
+
+// Runaway guard for Hold. The corridor abort cannot serve: it lives in the
+// Running block, and its corridor is a moving band. Here the setpoint is a
+// constant, so a plain absolute ceiling is both correct and unambiguous --
+// none of the cooling-timer reasoning behind CORRIDOR_ABORT_C applies.
+#define HOLD_ABORT_C      40.0f
+
+// Proportional band for the hold regulator, and the reason it exists.
+//
+// The obvious thing here is the dwell regulator -- nudge the level up while
+// the projection sits below target, down while it sits above -- and it does
+// not survive the move. A dwell starts AT temperature, so its level never has
+// to travel far. A hold is entered from wherever the oven is, and a pure
+// integrator then winds all the way to full power and stays there until the
+// projection nearly arrives. The oven reaches its setpoint still at 100% and
+// unwinds one level per control interval while continuing to absorb heat.
+// Measured on this oven before the P term was added, not predicted.
+//
+// That breaks the projection's own premise. projectedTemp means "where the
+// oven ends up if the relay opens NOW", and the controller was not opening it
+// now -- it took 16-64 s to step down. Measured: a 200 degC hold entered at
+// 1.18 degC/s sat at full power until 176 and peaked at 209.4.
+//
+// A proportional term fixes it at the source, because demand becomes a
+// function of the error rather than an accumulation: at the moment the
+// projection says "arriving", power is already near zero, which is what the
+// projection assumed all along. Full demand at HOLD_PBAND_C below target,
+// falling linearly to nothing at the target.
+#define HOLD_PBAND_C      25.0f
+
+// P alone parks below setpoint -- holding a temperature needs real power, and
+// a proportional term commands none at zero error. This trims that out.
+//
+// It integrates ONLY inside the proportional band. Outside it P already
+// commands the extreme, so accumulating there is windup and nothing else --
+// the exact defect this pair of constants exists to remove. 0.25 levels per
+// 8 s control interval reaches the 2-3 levels an equilibrium needs in about a
+// minute and a half, which is slow against the oven and cannot itself drive
+// an overshoot.
+#define HOLD_TRIM_STEP     0.25f
+
 // A heating step that times out on its slow bound this far short of target has
 // not merely run slow -- the element is not heating. The PID build had no such
 // check: its state machine advanced on the computed setpoint, so a dead element
@@ -688,6 +751,10 @@ typedef enum {
   // so the phase is a step index and there is one running state.
   Running = 10,
 
+  // Regulate to a fixed temperature and stay there. Above ProcessStart so it
+  // counts as an active cycle and the mutation lockout applies.
+  Hold = 15,
+
   Complete = 20,
 
   // Self-measurement of the thermal lag. Above ProcessStart, so it counts as an
@@ -796,6 +863,9 @@ uint8_t manualPower = 0;
 float thermalLagSec = THERMAL_LAG_DEFAULT_S;
 // Temperature /measurelag heats to before cutting the power.
 int16_t measureTempC = MEASURE_TEMP_DEFAULT_C;
+int16_t  holdTempC   = 0;      // Hold setpoint, degC
+uint64_t holdSetAt_ms = 0;     // when this hold (or its latest setpoint) began
+float    holdTrim    = 0.0f;   // integral term, in power levels
 // Result of the last measurement, 0 if none this power-up.
 float measuredLagSec = 0.0f;
 // Set when the oven has peaked and wants its door opened. The buzzer says so
@@ -1047,6 +1117,7 @@ const char * currentStateToString()
     casePrintState(Running);
     casePrintState(Complete);
     casePrintState(Manual);
+    casePrintState(Hold);
     casePrintState(MeasureLag);
     default: return "Ready";
   }
@@ -1711,6 +1782,54 @@ void setup() {
     currentState = MeasureLag;
     serverAction.send(200, "text/plain", "OK");
   });
+  // Hold a fixed temperature until stopped. See HOLD_TEMP_MIN_C.
+  //
+  // Accepted from Hold as well as Ready, and that is the point: a probe is
+  // characterised by stepping through levels, so changing the setpoint must
+  // not require stopping and re-entering from a cold chamber.
+  //
+  // Deliberately NOT gated on PROFILE_START_MAX_C. That limit exists because
+  // a profile run must not start from a chamber whose stored heat it has not
+  // accounted for, and because loading a board means reaching into the oven.
+  // Neither applies here: nothing is loaded mid-sweep, and a hold has no
+  // schedule to invalidate -- the second level of any sweep is entered warm
+  // by design.
+  serverAction.on("/hold", []() {
+    serverAction.sendHeader("Cache-Control","no-cache");
+    serverAction.sendHeader("Access-Control-Allow-Origin","*");
+    if((currentState != Ready && currentState != Hold) || globalError)
+    {
+      serverAction.send(409, "text/plain", "Controller busy");
+      return;
+    }
+    if(!serverAction.hasArg("temp"))
+    {
+      serverAction.send(400, "text/plain", "temp required");
+      return;
+    }
+    long v = serverAction.arg("temp").toInt();
+    if(v < HOLD_TEMP_MIN_C || v > HOLD_TEMP_MAX_C)
+    {
+      char msg[96];
+      snprintf(msg, sizeof(msg), "Hold temp must be %d-%dC",
+               HOLD_TEMP_MIN_C, HOLD_TEMP_MAX_C);
+      serverAction.send(409, "text/plain", msg);
+      return;
+    }
+    holdTempC    = (int16_t)v;
+    holdSetAt_ms = esp_timer_get_time()/1000;   // restart the timeout
+    if(currentState != Hold)
+    {
+      // Fresh entry only. Stepping the setpoint mid-sweep keeps the trim,
+      // because the power an equilibrium needs at the last level is a better
+      // starting guess for the next one than zero is.
+      holdTrim       = 0.0f;
+      cycleStartTime = esp_timer_get_time();
+      currentState   = Hold;
+    }
+    Serial.printf("Hold at %dC\n", holdTempC);
+    serverAction.send(200, "text/plain", "OK");
+  });
   serverAction.on("/factoryreset", []() {
     serverAction.sendHeader("Cache-Control","no-cache");
     serverAction.sendHeader("Access-Control-Allow-Origin","*");
@@ -2061,7 +2180,7 @@ void loop()
     //
     // Ahead of the Running block rather than inside it, so the step machinery
     // does not get one more pass after the decision to stop has been made.
-    if (globalError && currentState == Running)
+    if (globalError && (currentState == Running || currentState == Hold))
     {
       powerLevel   = 0;
       currentState = Complete;
@@ -2712,6 +2831,69 @@ void loop()
 
       powerHeater = (uint8_t)PH_FOR_LEVEL(powerLevel);
     }
+    else if (currentState == Hold)
+    {
+      // Same law as everywhere else: steer the PROJECTION, not the present
+      // temperature. With a mechanical relay and an element hotter than the
+      // air, heat already committed arrives after the thermometer reads the
+      // target -- which is what makes a naive setpoint controller oscillate
+      // here regardless of its gains.
+      float projectionRate = controlRamp;
+      if (projectionRate >  PROJECTION_MAX_RATE_C_S) projectionRate =  PROJECTION_MAX_RATE_C_S;
+      if (projectionRate < -PROJECTION_MAX_RATE_C_S) projectionRate = -PROJECTION_MAX_RATE_C_S;
+      float projectedTemp = aktSystemTemperature + projectionRate * thermalLagSec;
+
+      heaterSetpoint = holdTempC;
+      corridorLow    = holdTempC - DWELL_BAND_C;
+      corridorHigh   = holdTempC + DWELL_BAND_C;
+
+      // Runaway guard. Unlike the corridor abort this compares against a
+      // constant, so being far above it means one thing only.
+      if (aktSystemTemperature > holdTempC + HOLD_ABORT_C)
+      {
+        reportError("Hold: oven far above setpoint -- "
+                    "check for a welded relay contact");
+      }
+
+      // Unattended element, no profile to end the cycle.
+      if (time_ms - holdSetAt_ms >= (uint64_t)HOLD_TIMEOUT_S * 1000ull)
+      {
+        Serial.printf("Hold at %dC timed out after %d s\n",
+                      holdTempC, HOLD_TIMEOUT_S);
+        currentState = Complete;
+        powerLevel   = 0;
+        beepcount    = 2;
+      }
+      else if (relayWindowSeq - lastLevelWindow >= CONTROL_WINDOWS)
+      {
+        lastLevelWindow = relayWindowSeq;
+
+        const float TOP = (float)(POWER_LEVELS - 1);
+        float err = (float)holdTempC - projectedTemp;
+
+        // Proportional. Computed, never accumulated -- see HOLD_PBAND_C.
+        float p = (err / HOLD_PBAND_C) * TOP;
+        if (p < 0.0f) p = 0.0f;
+        if (p > TOP)  p = TOP;
+
+        // Integral trim, gated to the band and to outside the deadband so it
+        // does not hunt once the oven is where it was asked to be.
+        float mag = fabsf(err);
+        if (mag < HOLD_PBAND_C && mag > DWELL_BAND_C)
+        {
+          holdTrim += (err > 0.0f) ? HOLD_TRIM_STEP : -HOLD_TRIM_STEP;
+          if (holdTrim < 0.0f) holdTrim = 0.0f;
+          if (holdTrim > TOP)  holdTrim = TOP;
+        }
+
+        float lvl = p + holdTrim;
+        if (lvl < 0.0f) lvl = 0.0f;
+        if (lvl > TOP)  lvl = TOP;
+        powerLevel = (uint8_t)(lvl + 0.5f);
+      }
+
+      powerHeater = (uint8_t)PH_FOR_LEVEL(powerLevel);
+    }
     else if(currentState == Manual)
     {
       powerHeater=((uint16_t)manualPower*255)/100;
@@ -2729,11 +2911,12 @@ void loop()
       openDoorPrompt = false;
     }
 
-    if (currentState != Running)
+    if (currentState != Running && currentState != Hold)
     {
       // Nothing defines a corridor outside a profile run, and leaving the last
       // one in place puts a stale band on the chart that looks like the oven
-      // is being held somewhere it is not.
+      // is being held somewhere it is not. Hold is excluded because it does
+      // define one -- its deadband, set in its own branch.
       corridorLow = corridorHigh = heaterSetpoint = aktSystemTemperature;
     }
   }

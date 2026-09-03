@@ -458,6 +458,12 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         $('#manual_set').click(function(){
             act("manual", {power: $('#manual_power').val()});
         });
+        $('#hold_set').click(function(){
+            act("hold", {temp: $('#hold_temp').val()});
+        });
+        $('#hold_stop').click(function(){
+            act("stop");
+        });
         $('#reset').click(function(){
             if(confirm("Factory reset? This erases all profiles and the WiFi credentials."))
                 act("factoryreset").done(loadConfig);
@@ -677,6 +683,19 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             <span>How far the oven keeps climbing after the relay opens. Measure
               it loaded with a representative board &mdash; an empty oven is a
               different oven.</span>
+          </fieldset>
+
+          <fieldset><legend>Hold temperature</legend>
+            <label>Hold at (&deg;C) <input id="hold_temp" type="number" value="100" size="5"></label>
+            <button id="hold_set">Hold</button>
+            <button id="hold_stop">Stop</button><br>
+            <span>Regulates to a fixed temperature so the oven probe can be
+              compared against a reference meter. Send a new value to step to
+              the next level without stopping &mdash; the chamber does not have
+              to cool down in between. Read both instruments at the same
+              moment: power is quantised, so the oven settles into a slow cycle
+              about the setpoint rather than sitting perfectly still, and
+              reading them together cancels it.</span>
           </fieldset>
 
           <fieldset><legend>Manual heating</legend>
