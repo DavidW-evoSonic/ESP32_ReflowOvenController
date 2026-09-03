@@ -2183,9 +2183,32 @@ void loop()
       //
       // Cooling steps stay on the measured temperature. The projection exists
       // to stop the *actuator* overshooting, and nothing drives a descent.
+      //
+      // ...but "arriving hot" is only a hazard where the target is a ceiling.
+      // A step that leads into a HOTTER step has no ceiling to protect: every
+      // degree of overshoot is progress toward the next target, while cutting
+      // early just hands the shortfall forward. Measured on the 2026-09-04
+      // run, where both preheat steps did exactly that -- 170 left at 164.5
+      // and 220 left at 213.1 -- so the board soaked at neither, and the peak
+      // ramp began 7 degC down. Those steps now advance on the thermometer.
+      //
+      // The peak keeps the projection, which is the whole reason it exists:
+      // there, and on every descent, the target really is a limit. In the
+      // default profile that makes this exactly the 170 and 220 steps, and
+      // changes nothing about how 240 is approached.
+      //
+      // Note the two fixes converge: once a step genuinely reaches its target,
+      // the corridor anchoring below has nothing left to carry forward, and
+      // stepStartTemp is the measurement again.
+      bool nextHotter = (activeStep + 1 < activeProfile.stepCount) &&
+                        (activeProfile.steps[activeStep + 1].targetTemp
+                           > step.targetTemp);
       bool reached  = isDwell ||
-                      (dir > 0.0f ? (projectedTemp >= step.targetTemp)
-                                  : (aktSystemTemperature <= step.targetTemp));
+                      (dir > 0.0f
+                         ? (nextHotter
+                              ? (aktSystemTemperature >= (float)step.targetTemp)
+                              : (projectedTemp        >= (float)step.targetTemp))
+                         : (aktSystemTemperature <= step.targetTemp));
       bool minMet  = elapsed_s >= minDur;
       bool overrun = (maxDur > 0.0f) && (elapsed_s >= maxDur);
 
