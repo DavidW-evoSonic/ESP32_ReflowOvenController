@@ -400,6 +400,17 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                 $('#o_thermalLag').val(c.oven.thermalLag);
                 $('#o_measureTemp').val(c.oven.measureTemp);
                 startMax = c.oven.startMaxTemp;
+                // Build identity, next to the upload control on purpose:
+                // this is what you compare against before an OTA push, and
+                // what confirms the push took after the oven reboots.
+                //
+                // The build stamp is the load-bearing half. The version is
+                // hand-maintained and so can lie -- two builds ship as 2.0.1
+                // if nobody bumps it -- whereas __DATE__/__TIME__ move on
+                // every rebuild whether or not anyone remembered.
+                $('#fw_ver').text(c.version
+                    ? "Running " + c.version + " \u2014 built " + c.build
+                    : "Running: unknown (pre-2.0.1 build)");
                 // Never the password itself, only whether one is set.
                 $('#ota_none').toggle(!c.otaSet);
                 $('#ota_have').toggle(!!c.otaSet);
@@ -670,6 +681,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
           </fieldset>
 
           <fieldset><legend>Firmware (OTA)</legend>
+            <div id="fw_ver" style="margin-bottom:6px; font-weight:bold">&mdash;</div>
             <div id="ota_none">
               <label>Set OTA password <input id="ota_new" type="password" size="14"></label>
               <button id="ota_set">Set</button><br>

@@ -5,6 +5,26 @@
 // (c) 2012-2013 Ed Simmons
 // ----------------------------------------------------------------------------
 
+// Firmware build identity.
+//
+// There is no other way to tell what is on the oven. The API exposed nothing
+// version-shaped, and on 2026-09-04 that cost a diagnosis: the running profile
+// could be dated from its step values, but the CODE could not be dated at all,
+// because both that day's commits changed only control logic and left every
+// JSON field identical.
+//
+// FW_VERSION is the deliberate part -- bump it when flashing something worth
+// distinguishing. __DATE__/__TIME__ are the honest part: they change on every
+// rebuild whether or not the version was bumped, which is exactly the failure
+// mode a hand-maintained number has. Compare the build stamp, not the version,
+// when the question is "is what I just built actually on the oven".
+//
+// Emitted by /config and printed at boot. Deliberately NOT in /status: that is
+// polled once a second into a fixed 512-byte buffer that is already most of
+// the way full, and a constant does not belong in a per-second poll.
+#define FW_VERSION "2.0.1"
+#define FW_BUILD   __DATE__ " " __TIME__
+
 //Devdefins
 //#define NOEDGEERRORREPORT 
 
@@ -1248,6 +1268,11 @@ static String jsonEscape(const char *in) {
 void setup() {
   //Debug
   Serial.begin(115200);
+
+  // First thing on the wire, so a serial monitor attached for the IP address
+  // also answers "which build is this".
+  Serial.println();
+  Serial.println("ReflowController " FW_VERSION "  build " FW_BUILD);
   
   //INIT Temps
   // 12dB attenuation, specified linear to ~2450mV. With the 1.5:1 divider (see
@@ -1472,7 +1497,9 @@ void setup() {
            ", \"measureTemp\": " + String(measureTempC) +
            ", \"measuredLag\": " + String(measuredLagSec, 1) +
            ", \"startMaxTemp\": " + String(PROFILE_START_MAX_C) +
-           "}, \"otaSet\": " + String(otaPassword.length() ? 1 : 0) + "}";
+           "}, \"otaSet\": " + String(otaPassword.length() ? 1 : 0) +
+           ", \"version\": \"" FW_VERSION "\"" +
+           ", \"build\": \"" FW_BUILD "\"}";
     server.send(200, "application/json", out);
   });
   serverAction.on("/start", []() {
