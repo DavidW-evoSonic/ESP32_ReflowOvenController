@@ -35,6 +35,14 @@
 #define TEMP_ADC_CH     ADC1_CHANNEL_6
 
 #define BUZZER      25
+// LEDC channel 0, and the timer/speed-mode the Arduino wrapper maps it onto:
+// group = chan/8, timer = (chan/2)%4. Kept as names because setup() has to
+// hand the same mapping to the IDF driver directly -- see the channel init
+// there for why. The resolution matches what ledcWriteTone() picks.
+#define BUZZER_LEDC_CHANNEL LEDC_CHANNEL_0
+#define BUZZER_LEDC_TIMER   LEDC_TIMER_0
+#define BUZZER_LEDC_MODE    LEDC_HIGH_SPEED_MODE
+#define BUZZER_LEDC_BITS    10
 
 #define RGB_CLK     21
 #define RGB_SDO     26
@@ -301,6 +309,7 @@
 #include <SPI.h>
 #include <Ticker.h>
 #include <driver/adc.h>
+#include <driver/ledc.h>
 #include <esp_adc_cal.h>
 
 #include "root_html.h"
@@ -856,7 +865,29 @@ void setup() {
 
   //beep
   pinMode(BUZZER,OUTPUT);
-  ledcSetup(0,1000,0);
+  digitalWrite(BUZZER,LOW);
+  // The third argument is duty resolution in bits, not a channel index. It was
+  // 0, which is out of range, so this call failed and configured nothing --
+  // harmless only because ledcWriteTone() re-runs the timer config itself. 10
+  // bits is what ledcWriteTone() uses, so matching it here means the boot
+  // configuration and the beep agree and no tone has to reconfigure anything.
+  ledcSetup(0,1000,BUZZER_LEDC_BITS);
+  // ledcSetup() configures the *timer* only; the channel stays uninitialised.
+  // The first thing beep() does is ledcAttachPin(), which reads the channel's
+  // duty back before configuring it -- on an uninitialised channel that read
+  // is what logged "ledc_get_duty(745): LEDC is not initialized". There is no
+  // Arduino entry point that configures a channel without that read, so go to
+  // the IDF driver once here. Attaching the pin at duty 0 is silent, and every
+  // later ledcAttachPin() then finds a channel it can legitimately read.
+  ledc_channel_config_t buzzerChannel = {};
+  buzzerChannel.speed_mode = BUZZER_LEDC_MODE;
+  buzzerChannel.channel    = BUZZER_LEDC_CHANNEL;
+  buzzerChannel.intr_type  = LEDC_INTR_DISABLE;
+  buzzerChannel.timer_sel  = BUZZER_LEDC_TIMER;
+  buzzerChannel.gpio_num   = BUZZER;
+  buzzerChannel.duty       = 0;
+  buzzerChannel.hpoint     = 0;
+  ledc_channel_config(&buzzerChannel);
 
   //LEDs:
   RGBLED.begin(RGB_CLK,RGB_SDO,RGB_SDO,0);  
