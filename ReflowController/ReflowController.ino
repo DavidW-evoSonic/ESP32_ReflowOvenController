@@ -270,7 +270,14 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 // zero-filled, which reads as a large false climb for the first second.
 // Bounding the rate costs nothing and turns both into a slow step rather than
 // a profile that races to Complete.
-#define PROJECTION_MAX_RATE_C_S  5.0f
+// 2.0 degC/s, was 5.0. At 5.0 it clamped nothing this oven can do: the
+// measured maximum is 0.88 degC/s heating at full power and 1.62 cooling with
+// the door open, so the cap merely licensed a noise spike to project +25 degC
+// at a 5 s lag and slam the approach clamp shut. 2.0 sits above every rate
+// actually observed and well under the excursions, which makes it a safety
+// clamp again rather than a control input. Lower would start clipping real
+// cooling and bias the dwell arm.
+#define PROJECTION_MAX_RATE_C_S  2.0f
 
 // Half-width of the band a dwell step holds, in degC. Dwell steps have no
 // corridor to sit inside -- start and target are the same -- so they regulate
@@ -621,7 +628,42 @@ volatile bool     heaterOn=false;
 volatile uint64_t controlHeartbeat_ms=0;
 
 float aktSystemTemperature;
-float aktSystemTemperatureRamp; //°C/s
+float aktSystemTemperatureRamp; //°C/s  1 s difference -- for display only
+
+// The rate the control law steers on, degC/s, differenced across one whole
+// relay window instead of one second.
+//
+// Measured on the 2026-09-03 run: with the duty pinned at 100% and the true
+// rate constant at 0.88 degC/s by endpoint fit, aktSystemTemperatureRamp had a
+// mean of 0.92 and a standard deviation of 0.48 -- noise at 53% of signal,
+// with excursions to 2.40. Three separate decisions read that number (the
+// approach clamp, the fast-bound ceiling and the in-corridor rate check), so
+// each of them was acting on noise roughly half the time. The clamp sets
+// powerLevel to zero outright while recovery is one level per control
+// interval, so a single false trigger cost 16-32 s of climbing back.
+//
+// A median was the wrong instinct: the residuals are ordinary noise on the
+// temperature (about 0.35 degC of sigma, which differenced over 1 s gives the
+// 0.48 observed), not isolated outliers, and a median does nothing about that.
+// A longer baseline does -- the noise falls as 1/T while the signal does not.
+//
+// RELAY_WINDOW_MS is the right T for a second reason: differencing across
+// exactly one time-proportional cycle means partial duty cannot alias into the
+// rate at all.
+//
+// Replayed against that same recorded stretch, 4 s gives mean 0.86, sigma 0.30
+// and a range of 0.21..1.42 -- sigma cut 1.6x and the range no longer reaching
+// anywhere near the old 2.40. Note 1.6x, not the 4x that independent endpoint
+// noise would predict: a good part of the residual is real short-term
+// structure in the oven, not measurement noise, and no filter length removes
+// that. What matters downstream is the projection it feeds, which at a 5 s lag
+// and the tightened PROJECTION_MAX_RATE_C_S goes from sigma 2.4 degC peaking
+// at +12.0 to sigma 1.5 peaking at +7.1.
+//
+// The cost is that a difference is centred half its baseline back, so the
+// estimate carries ~2 s of lag -- which matters only while the rate is
+// changing, not on a steady ramp.
+float controlRamp = 0.0f;
 
 int activeProfileId = 0;
 Profile_t activeProfile; // the one and only instance
@@ -1757,6 +1799,23 @@ void loop()
 
     averagees[p]=aktSystemTemperature;
     p=(p+1)%(1000/READ_TEMP_INTERVAL_MS);
+
+    // The same difference taken across a whole relay window. See controlRamp.
+    #define CTRL_RAMP_SLOTS (RELAY_WINDOW_MS/READ_TEMP_INTERVAL_MS)
+    static float    ctrlRing[CTRL_RAMP_SLOTS];
+    static uint16_t cp = 0;
+    static bool     ctrlPrimed = false;
+
+    if (!ctrlPrimed)
+    {
+      ctrlPrimed = true;
+      for (int i=0;i<CTRL_RAMP_SLOTS;i++) ctrlRing[i]=aktSystemTemperature;
+    }
+
+    controlRamp = (aktSystemTemperature - ctrlRing[cp])
+                  / (RELAY_WINDOW_MS / 1000.0f);
+    ctrlRing[cp]=aktSystemTemperature;
+    cp=(cp+1)%CTRL_RAMP_SLOTS;
     
   }
 
@@ -1908,7 +1967,7 @@ void loop()
       // relay and an element hotter than the air, by the time the thermometer
       // reads the target the heat that overshoots it has already been
       // delivered. See thermalLagSec and THERMAL_LAG_DEFAULT_S.
-      float projectionRate = aktSystemTemperatureRamp;
+      float projectionRate = controlRamp;
       if (projectionRate >  PROJECTION_MAX_RATE_C_S) projectionRate =  PROJECTION_MAX_RATE_C_S;
       if (projectionRate < -PROJECTION_MAX_RATE_C_S) projectionRate = -PROJECTION_MAX_RATE_C_S;
       float projectedTemp = aktSystemTemperature + projectionRate * thermalLagSec;
@@ -1957,7 +2016,7 @@ void loop()
             // actually contributes here in a way it never did there.
             // Only the slow half lives here. The fast bound is hoisted below,
             // because it has to govern every branch and not just this one.
-            float normRate = aktSystemTemperatureRamp / delta; // fraction of step per second
+            float normRate = controlRamp / delta; // fraction of step per second
             if (maxDur > 0.0f && normRate < 1.0f / maxDur) nudge = 1;
           }
         }
@@ -1984,7 +2043,7 @@ void loop()
         // guard keeps an existing -2 hard backoff from being weakened.
         if (!isDwell && minDur > 0.0f && nudge > -1)
         {
-          float rateFrac = aktSystemTemperatureRamp / delta; // fraction of step per second
+          float rateFrac = controlRamp / delta; // fraction of step per second
           if (rateFrac > 1.0f / minDur) nudge = -1;
         }
 
@@ -2222,6 +2281,26 @@ void loop()
           stepStartedTime_ms = time_ms;
           lastLevelWindow    = relayWindowSeq;
           stepExtending      = false;
+
+          // Enter a heating step at full duty instead of inheriting whatever
+          // the previous step was left holding.
+          //
+          // The approach clamp sets powerLevel to zero at the end of every
+          // heating step -- correctly; that is the deliberate early cut -- and
+          // the next step then began from that zero and climbed back one level
+          // per control interval. Measured on the 2026-09-03 run: 21 s to
+          // regain full power on a step whose entire maximum duration was
+          // 28 s. The power ramp was longer than the step, so a short step
+          // could not be met however capable the element was.
+          //
+          // Safe for the same reason the full-duty entry at run start is: the
+          // approach clamp is ungated, re-tests every 100 ms, and takes the
+          // power straight back off the moment arrival is assured.
+          if ((float)activeProfile.steps[activeStep].targetTemp
+              > aktSystemTemperature + DWELL_BAND_C)
+          {
+            powerLevel = POWER_LEVELS - 1;
+          }
           stepGainRef_ms     = time_ms;
           stepGainRefTemp    = aktSystemTemperature;
           stepGaining        = true;
