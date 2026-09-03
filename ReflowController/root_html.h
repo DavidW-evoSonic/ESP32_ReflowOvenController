@@ -91,6 +91,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             chartdata.addColumn('number', "Corridor low");
             chartdata.addColumn('number', "Corridor high");
             chartdata.addColumn('number', "Power");
+            coastRows = 0;
         }
         initchartdata();
 
@@ -161,6 +162,16 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         var lastState= "";
         var running=false;
         var startMax=null;   // from /config: chamber must be below this to start
+        // Complete is not cold. The profile stops where the controller stops
+        // driving, and a fault stops it outright with the whole ramp down
+        // still ahead -- either way the cooling curve is the part that says
+        // whether the chamber sheds heat fast enough to set the joints, and it
+        // used to be thrown away the instant the state changed. Keep sampling
+        // past Complete, bounded so an oven left sitting warm does not grow
+        // the table forever.
+        var coastRows=0;
+        var COAST_STOP_C=50;    // below this the curve has nothing left to say
+        var COAST_MAX_ROWS=900; // 15 min at 1 Hz
         function loadstatus()
         {
           var lastcall=Date.now();
@@ -279,9 +290,23 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                     classicOptions.hAxis.viewWindow.max=null;
              }
 
-             if(data.state!="Ready" && data.state!="Complete"){
-                 chartdata.addRow([data.time/1000, lable, data.temp, data.setpoint,
-                                   data.low, data.high, data.power]);
+             var coasting = (data.state=="Complete"
+                             && coastRows < COAST_MAX_ROWS
+                             && data.temp > COAST_STOP_C);
+             if(data.state!="Ready" && (data.state!="Complete" || coasting)){
+                 // Idle, the firmware parks setpoint and corridor on the
+                 // present temperature, so charting them past Complete would
+                 // draw a target line that merely traces the thermometer.
+                 // Null instead: the corridor series end where the run did and
+                 // the temperature carries on alone.
+                 if(coasting){
+                     coastRows++;
+                     chartdata.addRow([data.time/1000, lable, data.temp,
+                                       null, null, null, data.power]);
+                 } else {
+                     chartdata.addRow([data.time/1000, lable, data.temp, data.setpoint,
+                                       data.low, data.high, data.power]);
+                 }
                  classicOptions.hAxis.viewWindow.max=Math.max(100,Math.round(data.time/1000.0)+10);
                  needDraw=true;
              }
