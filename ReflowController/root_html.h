@@ -283,7 +283,11 @@ const char ROOT_HTML[] PROGMEM = R"=====(
              }
 
              if(data.fault){
-                 $('#fault').text("FAULT: "+data.fault+" -- power cycle the oven").show();
+                 // No "power cycle the oven" here. It was appended to every
+                 // fault regardless of cause and told the operator nothing
+                 // about the one they had -- and a reboot does not fix any of
+                 // the conditions that raise one.
+                 $('#fault').text("FAULT: "+data.fault).show();
              }
 
              // draw() rebuilds the whole SVG, so it is now called only when
