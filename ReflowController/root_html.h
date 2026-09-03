@@ -4,15 +4,32 @@ const char ROOT_HTML[] PROGMEM = R"=====(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-      html, body { height: 100%; }
+      /* This is a fixed-viewport app: the page itself must never scroll.
+         Without this the chart's SVG overflows its box by a pixel or two, the
+         page gains a scrollbar, that narrows the viewport, the chart redraws
+         smaller, the scrollbar goes away -- and it oscillates on alternate
+         refreshes. Panels that can genuinely exceed the viewport scroll
+         themselves instead; see #controls. */
+      html, body { height: 100%; overflow: hidden; }
       body { margin: 0; display: flex; flex-direction: column;
              font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 
       /* Live readout. Always visible, above the graph, legible across a
          workshop -- this is the thing you look at while the oven runs. */
-      #readout { flex: none; display: flex; flex-wrap: wrap; align-items: stretch;
-                 gap: 1px; background: #d4d4d8; border-bottom: 1px solid #d4d4d8; }
-      #readout .tile { flex: 1 1 140px; background: #fafafa; padding: 8px 14px; }
+      /* Grid, not flex, and every column minmax(0,1fr).
+         As flex items the tiles took min-width:auto, so the longest sub-line
+         of the second -- "corridor 120.1-132.9 C" -- forced its own tile wider
+         and squeezed the others. The row then changed height and the chart
+         below it resized, once a second, forever. Equal 0-basis grid tracks
+         cannot be widened by their contents. */
+      #readout { flex: none; display: grid; gap: 1px;
+                 grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                 background: #d4d4d8; border-bottom: 1px solid #d4d4d8; }
+      #readout .tile { min-width: 0; background: #fafafa; padding: 8px 14px; }
+      /* Clip rather than wrap: a wrapped line is the other way the row
+         changes height mid-refresh. */
+      #readout .label, #readout .value, #readout .sub {
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       #readout .label { font-size: 11px; font-weight: 600; letter-spacing: .08em;
                         text-transform: uppercase; color: #71717a; }
       #readout .value { font-size: 44px; line-height: 1.05; font-weight: 700;
@@ -24,7 +41,11 @@ const char ROOT_HTML[] PROGMEM = R"=====(
       #r_target .value { color: #2563eb; }
 
       /* The heater pill reports the contact, not the demand -- see #heating. */
-      #r_heat .value { font-size: 34px; letter-spacing: .04em; }
+      #r_state .value, #r_heat .value { font-size: 34px; letter-spacing: .04em; }
+      /* Reserve the tall line height on every tile regardless of which font
+         size it uses, so swapping "Ready" for "EXTENDING" cannot move the
+         row. */
+      #readout .value { min-height: 46px; }
       #r_heat.on  { background: #fef2f2; }
       #r_heat.on  .value { color: #dc2626; }
       #r_heat.off .value { color: #a1a1aa; }
@@ -38,10 +59,20 @@ const char ROOT_HTML[] PROGMEM = R"=====(
       #readout.stale { opacity: .45; }
       #readout.stale .value::after { content: " ?"; color: #a1a1aa; }
 
-      #stage { position: relative; flex: 1 1 auto; min-height: 0; }
-      #chart_div { width: 100%; height: 100%; }
+      #stage { position: relative; flex: 1 1 auto; min-height: 0;
+               overflow: hidden; }
+      /* Absolutely positioned, not width/height 100%.
+         A percentage height on a Google Charts container inside a flex child
+         is a sizing feedback loop: the chart measures the box, draws an SVG,
+         the SVG participates in the flex child's height, and the next draw
+         measures something different. inset:0 gives it a definite size that
+         its own content cannot influence. */
+      #chart_div { position: absolute; inset: 0; overflow: hidden; }
+      /* The settings panel is taller than the viewport on a laptop, and the
+         page can no longer scroll to reach it -- so it scrolls itself. */
       #controls { position: absolute; top: 0; left: 0; z-index: 1000;
-                  background: rgba(255,255,255,0.9); padding: 6px; }
+                  max-height: 100%; overflow-y: auto; overscroll-behavior: contain;
+                  background: rgba(255,255,255,0.92); padding: 6px; }
     </style>
     <script type="text/javascript" src="https://www.gstatic.com/charts/loader.js"></script>
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.min.js"></script>
@@ -107,6 +138,13 @@ const char ROOT_HTML[] PROGMEM = R"=====(
               viewWindow: {
                   max: 100
               },
+          },
+          // Pin the plot rectangle. Left to itself Google Charts sizes it from
+          // the axis label widths, and hAxis.viewWindow.max grows every second
+          // during a run (100, 110, 120...), so the tick labels change width
+          // and the whole plot shifts on each redraw.
+          chartArea: {
+            left: '9%', right: '9%', top: '11%', bottom: '15%'
           },
             annotations: {
                alwaysOutside: true,
@@ -201,11 +239,23 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                  $('#fault').text("FAULT: "+data.fault+" -- power cycle the oven").show();
              }
 
+             // draw() rebuilds the whole SVG, so it is now called only when
+             // the picture has actually changed. It used to run on every poll
+             // -- once a second, even sitting idle in Complete with static
+             // data -- and each rebuild was a visible relayout.
+             var stateChanged = (data.state != lastState);
+             var lable   = null;
+             var needDraw = false;
+
              if(data.state=="Ready")
              {
-                 //clear all
-                 initchartdata();
-                 lastState="Ready";
+                 // Only on the way in. Rebuilding the DataTable every poll was
+                 // what forced a redraw a second while idle.
+                 if(stateChanged){
+                     initchartdata();
+                     classicOptions.hAxis.viewWindow.max=100;
+                     needDraw=true;
+                 }
                  running=false;
                  $('#action').text(
                      (startMax!==null && data.temp > startMax)
@@ -213,39 +263,27 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                      : "Start Reflow");
              }
              else{
-                 if(data.state=="Complete"){
-                    $('#action').text("Reset");
-                 }
-                 else{
-                    $('#action').text("Cancel");
-                 }
+                 $('#action').text(data.state=="Complete" ? "Reset" : "Cancel");
                  running=true;
              }
 
-             var lable=null;
-             if(data.state!=lastState)
+             if(stateChanged)
              {
-                lastState= data.state;
-                lable=data.state;
+                lastState = data.state;
+                lable     = data.state;
+                needDraw  = true;
+                if(data.state=="Complete")
+                    classicOptions.hAxis.viewWindow.max=null;
              }
-             
 
              if(data.state!="Ready" && data.state!="Complete"){
                  chartdata.addRow([data.time/1000, lable, data.temp, data.setpoint,
                                    data.low, data.high, data.power]);
                  classicOptions.hAxis.viewWindow.max=Math.max(100,Math.round(data.time/1000.0)+10);
+                 needDraw=true;
              }
-             if(data.state=="Ready")
-             {
-                 classicOptions.hAxis.viewWindow.max=100;
-             }
-             if(data.state=="Complete")
-             {
-                 classicOptions.hAxis.viewWindow.max=null;
-             }
-             
 
-             classicChart.draw(chartdata, classicOptions);
+             if(needDraw) classicChart.draw(chartdata, classicOptions);
            })
            .fail(function() {
              $('#readout').addClass('stale');
@@ -255,6 +293,16 @@ const char ROOT_HTML[] PROGMEM = R"=====(
            });
 
         }
+
+        // The chart no longer redraws on a timer, so the one thing that still
+        // legitimately needs one has to ask for it.
+        var resizeTimer=null;
+        $(window).on('resize', function(){
+            clearTimeout(resizeTimer);
+            resizeTimer=setTimeout(function(){
+                classicChart.draw(chartdata, classicOptions);
+            }, 150);
+        });
 
         loadstatus();
 
@@ -420,7 +468,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
     <div id="readout">
       <div class="tile" id="r_state">
         <div class="label">State</div>
-        <div class="value" style="font-size:34px" id="v_state">&mdash;</div>
+        <div class="value" id="v_state">&mdash;</div>
         <div class="sub" id="v_step">&nbsp;</div>
       </div>
       <div class="tile" id="r_temp">
