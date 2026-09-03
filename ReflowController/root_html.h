@@ -50,6 +50,14 @@ const char ROOT_HTML[] PROGMEM = R"=====(
       #r_heat.on  .value { color: #dc2626; }
       #r_heat.off .value { color: #a1a1aa; }
 
+      /* Controller die temperature. Amber and red rather than a number that
+         has to be interpreted -- the point of this tile is to be noticed from
+         across the room, not read. */
+      #r_mcu.warn { background: #fffbeb; }
+      #r_mcu.warn .value { color: #b45309; }
+      #r_mcu.hot  { background: #fef2f2; }
+      #r_mcu.hot  .value { color: #dc2626; }
+
       /* An extension is a departure from the profile the step declared, so it
          gets its own colour rather than hiding in the state name. */
       #r_state.ext { background: #fffbeb; }
@@ -238,6 +246,31 @@ const char ROOT_HTML[] PROGMEM = R"=====(
              $('#v_heat').text(on ? "ON" : "OFF");
              $('#r_heat').toggleClass('on', on).toggleClass('off', !on);
              $('#v_duty').text(Math.round(data.power) + "% duty");
+
+             // Controller die temperature -- a hazard readout, not a
+             // diagnostic: the electronics sit in an enclosure inside the
+             // oven, a sheet of metal from the element. The thresholds live
+             // here rather than in the firmware because the firmware takes no
+             // action on them. 85 degC is the red line because that is the
+             // WROOM-32 module's rated maximum, and the W25Q32 flash's, not
+             // because of anything about the die itself.
+             var mcu = (typeof data.mcu == "number") ? data.mcu : null;
+             if(mcu === null){
+                 $('#v_mcu').html("&mdash;");
+                 $('#v_mcu_note').html("&nbsp;");
+                 $('#r_mcu').removeClass('warn hot');
+             } else {
+                 // temprature_sens_read() hands back a uint8_t in Fahrenheit,
+                 // so the scale stops dead at 255 F = 123.9 degC. Show a
+                 // pegged sensor as pegged; it is not a measurement.
+                 $('#v_mcu').text(mcu >= 123 ? "\u2265124" : mcu.toFixed(1));
+                 $('#r_mcu').toggleClass('hot',  mcu >= 85)
+                            .toggleClass('warn', mcu >= 70 && mcu < 85);
+                 $('#v_mcu_note').text(
+                     mcu >= 85 ? "OVER RATED MAX 85 \u00B0C"
+                   : mcu >= 70 ? "hot \u2014 rated max 85 \u00B0C"
+                   :             "die temp \u00B7 rated max 85 \u00B0C");
+             }
              // -------------------------------------------------------
 
              if(data.openDoor){
@@ -579,6 +612,11 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         <div class="label">Heater</div>
         <div class="value" id="v_heat">&mdash;</div>
         <div class="sub" id="v_duty">&nbsp;</div>
+      </div>
+      <div class="tile" id="r_mcu">
+        <div class="label">Electronics</div>
+        <div class="value"><span id="v_mcu">&mdash;</span><span class="unit">&deg;C</span></div>
+        <div class="sub" id="v_mcu_note">&nbsp;</div>
       </div>
     </div>
     <div id="door" style="display:none; flex:none; background:#fd7;

@@ -108,6 +108,17 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 #define READ_TEMP_INTERVAL_MS 100 
 #define READ_TEMP_AVERAGE_COUNT 10 
 
+// How often to sample the ESP32's own die temperature, milliseconds.
+//
+// Slowly, and deliberately so. temperatureRead() is backed by the undocumented
+// temprature_sens_read() -- the typo is the real symbol name -- which resolves
+// out of librtc.a, the same blob that owns the RF calibration this sensor is
+// shared with. That sharing is why the reading carries an offset that moves
+// with WiFi state, and it is why there is nothing to gain from reading it
+// often. The enclosure it is reporting on has a thermal time constant in
+// minutes; 2 s is already far faster than the question needs.
+#define MCU_TEMP_INTERVAL_MS 2000
+
 // AD595 outputs 10 mV/degC, divided 1.5:1 in hardware before reaching the ADC
 // so that the reflow range lands mid-scale where the ESP32 ADC is most linear
 // (250degC -> 2.50V raw -> 1.67V at the pin) rather than against its ceiling.
@@ -653,6 +664,17 @@ bool stepExtending = false;
 // when nothing latches a fault.
 float runExtendUsed_s = 0.0f;   // total extension time this run
 float runExtendLiq_s  = 0.0f;   // ... of which was spent above liquidus
+// The controller's own die temperature, degC.
+//
+// The electronics sit in an enclosure inside the oven, one sheet of metal from
+// the element, so "are my electronics cooking" is a real question and this is
+// the only sensor aboard that can answer it. Reported to the operator and
+// nothing else: it never gates a start and never calls reportError(). An
+// undocumented blob function with an RF-dependent offset has no business
+// latching a fault that needs a power cycle to clear -- that would be a worse
+// failure than the one it is watching for. The thresholds that colour it live
+// in the UI, since the firmware takes no action on them.
+float mcuTemp_C = 0.0f;
 float stepStartTemp;    // measured temperature when the step began
 uint8_t powerLevel = 0; // 0..POWER_LEVELS-1, what the corridor law is asking for
 
@@ -1168,13 +1190,13 @@ void setup() {
       "{\"time\": %lu, \"temp\": %.2f, \"dt\": %.2f, \"setpoint\": %.2f,"
       " \"low\": %.2f, \"high\": %.2f, \"power\": %.2f, \"step\": %d,"
       " \"steps\": %d, \"lag\": %.1f, \"openDoor\": %d, \"heating\": %d,"
-      " \"extending\": %d, \"extended\": %.0f,"
+      " \"extending\": %d, \"extended\": %.0f, \"mcu\": %.1f,"
       " \"state\": \"%s\", \"fault\": \"%s\"}",
       time, aktSystemTemperature, aktSystemTemperatureRamp, heaterSetpoint,
       corridorLow, corridorHigh,
       (float)powerHeater*100.0f/255.0f, activeStep, activeProfile.stepCount,
       thermalLagSec, openDoorPrompt ? 1 : 0, heaterOn ? 1 : 0,
-      stepExtending ? 1 : 0, runExtendUsed_s,
+      stepExtending ? 1 : 0, runExtendUsed_s, mcuTemp_C,
       currentStateToString(), globalErrorText);
     server.send(200, "application/json", buffer);
   });
@@ -1617,6 +1639,7 @@ void loop()
   uint64_t time_ms = esp_timer_get_time()/1000;
   static uint64_t lastbeep=time_ms;
   static uint64_t lastreadTemp=time_ms;
+  static uint64_t lastMcuTemp=0;   // 0 means "never sampled", see below
   static uint64_t lastRGBupdate=time_ms;
   static uint64_t lastControlloopupdate=time_ms;
 
@@ -1650,6 +1673,20 @@ void loop()
       ledcDetachPin(BUZZER);
       isbeeping=false;
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // Controller die temperature
+  //
+  // The lastMcuTemp==0 arm fires on the very first pass so /status never
+  // publishes the initialiser. Seeding lastMcuTemp to
+  // time_ms - MCU_TEMP_INTERVAL_MS would do the same job but underflows the
+  // unsigned subtraction if setup() ever finishes in under 2 s, and the
+  // comparison would then never come true again.
+  if(lastMcuTemp == 0 || time_ms >= (lastMcuTemp + MCU_TEMP_INTERVAL_MS))
+  {
+    lastMcuTemp = time_ms;
+    mcuTemp_C   = temperatureRead();
   }
 
   // --------------------------------------------------------------------------
