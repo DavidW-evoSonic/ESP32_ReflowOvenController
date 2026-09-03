@@ -13,16 +13,35 @@
 // because both that day's commits changed only control logic and left every
 // JSON field identical.
 //
-// FW_VERSION is the deliberate part -- bump it when flashing something worth
-// distinguishing. __DATE__/__TIME__ are the honest part: they change on every
-// rebuild whether or not the version was bumped, which is exactly the failure
-// mode a hand-maintained number has. Compare the build stamp, not the version,
-// when the question is "is what I just built actually on the oven".
+// FW_VERSION is the deliberate part. __DATE__/__TIME__ are the honest part:
+// they change on every rebuild whether or not the version was bumped, which is
+// exactly the failure mode a hand-maintained number has. Compare the build
+// stamp, not the version, when the question is "is what I just built actually
+// on the oven".
+//
+// Semver, with the major deliberately expensive:
+//
+//   PATCH  a fix. Nothing a caller could not already do, nothing it did
+//          before that stops working. Both fault-message corrections were
+//          this.
+//   MINOR  new capability, backward compatible. A new route, a new state, a
+//          new field in a JSON response. Hold was this.
+//   MAJOR  reserved, and it should stay rare enough to be an event. Breaking
+//          an existing caller -- a route removed or its arguments changed, a
+//          /status or /config field renamed or dropped -- or a change to the
+//          safety model, such as giving faults a clear path or letting the
+//          element run during a cooling step. Adding to a JSON response is
+//          not breaking; changing what an existing key means is.
+//
+// A profile stored in NVS survives a flash whenever sizeof(Profile_t) is
+// unchanged, so a release that alters the DEFAULT profile does not reach an
+// oven that already has one saved. That is worth a line in the commit
+// message; it is not by itself a major.
 //
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.0.1"
+#define FW_VERSION "2.1.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
