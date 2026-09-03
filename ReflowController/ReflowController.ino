@@ -14,7 +14,14 @@
 //
 // Note 25/26 -- suggested in the original rework notes -- are NOT available:
 // they stay claimed by BUZZER and RGB_SDO. Still free if this ever has to
-// move: 17 (the other original heater pin), 27, 23, 22, 4, 33.
+// move: 17 (the other original heater pin), 27, 22, 4, 33.
+//
+// 23 was on that list and has been removed: it is tied straight to 3V3 on
+// this PCB, so driving it low would put the pad's low-side driver across the
+// rail with no series resistance. That is worse than it first looks, because
+// LOW is the *safe* heater state -- setup() and reportError() both write it --
+// so the short would happen exactly when the firmware was trying to make the
+// oven safe. The static_assert below stops that pin choice compiling.
 //
 // Two things this pin choice depends on, neither visible from the firmware:
 //
@@ -28,6 +35,29 @@
 //    pull-down to hold the heater off through that window. This is a hardware
 //    requirement, not something the firmware can arrange for itself.
 #define HEATER      16
+
+// The heater drives a mains relay, so a wrong pin here is not the sort of
+// mistake to leave discoverable by smoke. What these reject:
+//
+//   6-11   the internal SPI flash bus on a WROOM module; not usable at all
+//   12     MTDI straps VDD_SDIO to 1.8 V when high at reset, and this
+//          module's flash is a 3.3 V part -- it simply will not boot
+//   23     tied to 3V3 on this PCB; see above
+//   34-39  input-only, so pinMode(OUTPUT) silently does nothing and the
+//          relay would never be driven at all
+//
+// Not rejected, but worth knowing before moving this pin: 1, 3, 5, 14 and 15
+// emit pulses during reset, which is not something a relay gate should see.
+// 0 and 2 boot fine but tying either defeats serial download mode, and OTA
+// cannot recover a board that will not boot.
+static_assert(!(HEATER >= 6 && HEATER <= 11),
+              "HEATER: GPIO 6-11 are the internal SPI flash bus");
+static_assert(HEATER != 12,
+              "HEATER: GPIO 12 straps VDD_SDIO to 1.8V; the module will not boot");
+static_assert(HEATER != 23,
+              "HEATER: GPIO 23 is tied to 3V3 on this PCB; driving it low shorts the pad");
+static_assert(!(HEATER >= 34 && HEATER <= 39),
+              "HEATER: GPIO 34-39 are input-only and cannot drive the relay");
 
 // AD595 analog output. Must be an ADC1 channel (32-39); ADC2 is unusable while
 // WiFi is active. 34 is input-only, which suits a sensor input.
