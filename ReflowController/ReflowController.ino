@@ -204,7 +204,37 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 #define MAX_STEPS      8
 
 // Discrete power levels, 0..POWER_LEVELS-1, evenly spaced to 100%.
-#define POWER_LEVELS   5
+//
+// 9, was 5. At 5 every nudge was a 25% jump in duty, and the corridor law is a
+// pure integrator -- no proportional term, no memory of which duty produced
+// which rate -- so whenever the oven's capability did not match the rate the
+// profile declared it could not sit still. The 2026-09-04 run showed the
+// consequence in step 1: 100% down to 0 over 48 s and all the way back over
+// 32 s, an 80 s limit cycle across the entire actuator range. The oven really
+// does 2.1 degC/s at 50 degC and 0.88 at 200, against one declared bound of
+// 0.72-0.94, so no fixed duty holds it -- but with 9 levels the hunt covers
+// half the range it used to.
+//
+// 9 is the finest the relay allows: 12.5% of a 4 s window is a 500 ms pulse,
+// exactly RELAY_MIN_ON_MS. The static_assert below is what holds that true.
+#define POWER_LEVELS   9
+
+// Every partial level has to be a pulse the relay will actually accept.
+//
+// The level -> powerHeater -> onTime chain divides twice, and at POWER_LEVELS 9
+// the first level lands within 2 ms of the limit. Truncating rather than
+// rounding at the first division is enough to break it: 255/8 = 31, which is
+// 486 ms, and relayDriver() rounds anything under RELAY_MIN_ON_MS away to
+// fully off -- so level 1 would have silently become another zero. Checked
+// here rather than discovered on an oven.
+#define PH_FOR_LEVEL(k)     (((uint32_t)(k) * 255u + (POWER_LEVELS - 1) / 2) \
+                             / (POWER_LEVELS - 1))
+#define ONTIME_FOR_LEVEL(k) ((PH_FOR_LEVEL(k) * RELAY_WINDOW_MS) / 255u)
+static_assert(ONTIME_FOR_LEVEL(1) >= RELAY_MIN_ON_MS,
+              "lowest partial power level rounds away to fully off");
+static_assert(ONTIME_FOR_LEVEL(POWER_LEVELS - 2)
+                <= RELAY_WINDOW_MS - RELAY_MIN_OFF_MS,
+              "highest partial power level rounds up to fully on");
 
 // How often the power level is re-evaluated, in whole relay windows.
 //
@@ -232,6 +262,15 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 // Outside the corridor by more than this, the level moves by two rather than
 // one. Recovers from a badly-placed start without making normal tracking jumpy.
 #define CORRIDOR_HARD_C     10.0f
+
+// How many levels the hard arms move, when the oven is more than
+// CORRIDOR_HARD_C from the wall it is chasing.
+//
+// Derived from POWER_LEVELS rather than written as 2, because the two have to
+// move together. A literal 2 was half the range at POWER_LEVELS 5; left alone
+// through the change to 9 it would have quietly halved the loop's recovery
+// authority, which is the one thing finer resolution must not cost.
+#define CORRIDOR_HARD_NUDGE ((POWER_LEVELS - 1) / 2)
 
 // Thermal lag, seconds: how long the oven keeps rising after the element stops.
 //
@@ -356,7 +395,7 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 // a dwell holds. Only "asking for heat and getting none" is a fault.
 #define HEAT_STALL_WINDOW_MS   30000
 #define HEAT_STALL_MIN_RISE_C      2.0f
-// Half of full demand, rounded down. At POWER_LEVELS 5 that is level 2 of 4.
+// Half of full demand, rounded down. At POWER_LEVELS 9 that is level 4 of 8.
 #define HEAT_STALL_MIN_LEVEL   ((POWER_LEVELS - 1) / 2)
 
 // There is deliberately no distance gate on entering an extension.
@@ -401,10 +440,12 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 //
 // This, not the per-step cap, is the constraint that actually limits the
 // feature. Time above liquidus is what grows intermetallics and damages parts,
-// and the default profile spends 60.2-76.8 s above 217 degC on its own, before
-// any extension -- see the arithmetic at defaultSteps. Against a 60-90 s paste
-// spec that leaves 13.2 s of headroom at the slow bounds, so the budget is
-// 12 s: a fully extended run lands at 88.8 s, still inside spec.
+// and the default profile is expected near 65 s above 217 degC before any
+// extension -- see the note at defaultSteps, and note that figure is measured
+// rather than summed from declared durations, which overpredicted it by 13 s.
+// Against a 60-90 s paste spec that leaves about 25 s of headroom, so the
+// budget is 12 s: a fully extended run lands near 78 s, inside spec with room
+// for the estimate to be wrong again.
 //
 // It was 25 s, which was correct for the profile that existed then -- a
 // triangular 243 degC apex spending 61.8 s above liquidus. Adding the peak
@@ -1010,30 +1051,43 @@ void makeDefaultProfile() {
   // gains a hold. Lower is also kinder to parts -- plenty are rated 245-260
   // peak -- and 3 degC of air temperature was never what the joints saw.
   //
-  // Time above liquidus, which is the constraint that bounds all of this
-  // (217 degC, 60-90 s for SAC305):
+  // Time above liquidus is the constraint that bounds all of this: 217 degC,
+  // 60-90 s for SAC305.
   //
-  //   step 1  170->220  3/50 of the step is above 217   1.9 s ..  3.8 s
-  //   step 2  220->240  entirely above                 21.0 s .. 28.0 s
-  //   step 3  dwell     entirely above                 15.0 s   (see below)
-  //   step 4  240->220  entirely above                 21.0 s .. 28.0 s
-  //   step 5  220->150  3/70 of the step is above      1.3 s ..  1.9 s
-  //                                                   -----------------
-  //                                                   60.2 s .. 76.8 s
+  // Sizing it by summing the steps' declared durations does not work, and the
+  // 2026-09-04 run is the proof -- that method predicted 60.2-76.8 s and the
+  // oven delivered 47.4 s. Two reasons, both the same mistake:
   //
-  // Both ends now sit inside the spec. The old profile ran 45.2 s at its fast
-  // bounds, i.e. under the 60 s minimum -- so the dwell fixes an existing hole
-  // at the fast end as well as adding the hold.
+  //   - the 220 step was credited 1.9-3.8 s above 217 and contributed ZERO.
+  //     It advanced on the projection and left at 213.1 degC, never crossing
+  //     liquidus at all. (Fixed since -- a step leading into a hotter one now
+  //     advances on the thermometer -- which is worth 3.3 s here.)
+  //   - the 240->220 descent was credited its full 21-28 s and contributed
+  //     11.1 s. With the door open the oven falls at up to 4.3 degC/s and is
+  //     through 217 in eleven seconds, then spends the rest of its minDuration
+  //     continuing down to 180. Cooling steps are timers; their declared
+  //     duration says nothing about where the temperature is.
+  //
+  // So the only honest method is measurement, and the only DETERMINISTIC
+  // contribution is the dwell -- everything else depends on a trajectory. From
+  // the run: 32.3 s of measured non-dwell time, plus the 3.3 s the 220 step now
+  // earns, is a 35.6 s base. The 30 s dwell puts the total near 65 s, mid-spec,
+  // and RUN_EXTEND_LIQ_S 12 keeps a fully extended run near 78 s.
   //
   // The dwell contributes exactly its minDuration, not a range: `reached` is
   // unconditionally true for a dwell step (delta is zero, so isDwell), and the
   // step therefore advances the moment minMet. Its maxDuration is a watchdog
-  // and nothing else.
+  // and nothing else. Measured at 14.1 s against a nominal 15.
+  //
+  // Note a 30 s dwell will not be free the way the 15 s one was: that held on
+  // residual heat alone at 0% duty and was already declining by the end
+  // (241.57 -> 240.73 -> 240.40), so the dwell regulator will now have to
+  // supply real power partway through.
   static const Step_t defaultSteps[] = {
     { 170,  72,  94, BOUND_RATE     },  // 0.72-0.94 degC/s
     { 220,  31,  64, BOUND_DURATION },
     { 240,  21,  28, BOUND_DURATION },
-    { 240,  15,  25, BOUND_DURATION },  // dwell at peak; holds for 15 s
+    { 240,  30,  45, BOUND_DURATION },  // dwell at peak; holds for 30 s
     { 220,  21,  28, BOUND_DURATION },
     { 150,  30,  45, BOUND_DURATION },
     {  30,  20,  30, BOUND_DURATION },
@@ -2055,11 +2109,13 @@ void loop()
           {
             // Behind the corridor. Two levels if badly behind, so a cold start
             // or a late step recovers instead of creeping.
-            nudge = (dir * (behindTemp - aktSystemTemperature) > CORRIDOR_HARD_C) ? 2 : 1;
+            nudge = (dir * (behindTemp - aktSystemTemperature) > CORRIDOR_HARD_C)
+                    ? CORRIDOR_HARD_NUDGE : 1;
           }
           else if (progress > aheadFrac)
           {
-            nudge = (dir * (aktSystemTemperature - aheadTemp) > CORRIDOR_HARD_C) ? -2 : -1;
+            nudge = (dir * (aktSystemTemperature - aheadTemp) > CORRIDOR_HARD_C)
+                    ? -CORRIDOR_HARD_NUDGE : -1;
           }
           else
           {
@@ -2098,7 +2154,8 @@ void loop()
         // would freeze the level at whatever produced the over-rate, so the
         // over-rate would persist. The -1 is what actually walks it down, and
         // it is what the in-corridor arm did before the hoist. The nudge > -1
-        // guard keeps an existing -2 hard backoff from being weakened.
+        // guard keeps an existing hard backoff (-CORRIDOR_HARD_NUDGE) from
+        // being weakened.
         if (!isDwell && minDur > 0.0f && nudge > -1)
         {
           float rateFrac = controlRamp / delta; // fraction of step per second
@@ -2488,7 +2545,7 @@ void loop()
         heatStallRef_ms = 0;
       }
 
-      powerHeater = (uint16_t)powerLevel * 255 / (POWER_LEVELS - 1);
+      powerHeater = (uint8_t)PH_FOR_LEVEL(powerLevel);
     }
     else if (currentState == MeasureLag)
     {
@@ -2584,7 +2641,7 @@ void loop()
         }
       }
 
-      powerHeater = (uint16_t)powerLevel * 255 / (POWER_LEVELS - 1);
+      powerHeater = (uint8_t)PH_FOR_LEVEL(powerLevel);
     }
     else if(currentState == Manual)
     {
