@@ -1531,10 +1531,37 @@ void loop()
             // rate term in integer arithmetic that truncated to 1 degC/s against
             // profile rates of 0.72-1.61 -- barely one bit -- so this term
             // actually contributes here in a way it never did there.
+            // Only the slow half lives here. The fast bound is hoisted below,
+            // because it has to govern every branch and not just this one.
             float normRate = aktSystemTemperatureRamp / delta; // fraction of step per second
             if (maxDur > 0.0f && normRate < 1.0f / maxDur) nudge = 1;
-            else if (minDur > 0.0f && normRate > 1.0f / minDur) nudge = -1;
           }
+        }
+
+        // The step's fast rate bound, in force in EVERY branch above.
+        //
+        // It used to live inside the "inside the corridor" arm, which made it
+        // unreachable exactly when it matters most: aheadFrac and behindFrac
+        // are clamped to 1.0, so once elapsed_s reaches maxDuration a step
+        // short of target is permanently "behind" and takes the first branch.
+        // A step extension would then have been a full-power dash at whatever
+        // rate the element managed.
+        //
+        // Being behind on the clock is not a licence to exceed the ramp the
+        // profile declared: that rate is a property of the paste, not of the
+        // schedule. minDur comes from deriveStepDurations(), so for a
+        // rate-bounded step 1/minDur is literally boundHi -- the profile's own
+        // maximum ramp, restated in fractions of the step.
+        //
+        // Backing off by one and not merely to zero: clamping the nudge to 0
+        // would freeze the level at whatever produced the over-rate, so the
+        // over-rate would persist. The -1 is what actually walks it down, and
+        // it is what the in-corridor arm did before the hoist. The nudge > -1
+        // guard keeps an existing -2 hard backoff from being weakened.
+        if (!isDwell && minDur > 0.0f && nudge > -1)
+        {
+          float rateFrac = aktSystemTemperatureRamp / delta; // fraction of step per second
+          if (rateFrac > 1.0f / minDur) nudge = -1;
         }
 
         // Corridor terms into power terms. On a cooling step making more
