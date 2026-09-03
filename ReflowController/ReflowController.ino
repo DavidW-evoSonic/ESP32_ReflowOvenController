@@ -2141,7 +2141,47 @@ void loop()
         }
         else
         {
-          stepStartTemp      = aktSystemTemperature;
+          // Anchor a step that ramps UP at the profile's own target rather
+          // than at whatever the thermometer happens to read here.
+          //
+          // Rebasing on the measurement let every step redraw its corridor
+          // from the previous step's shortfall, so an undershoot was not made
+          // up -- it was adopted. progress is (temp - stepStartTemp)/delta, so
+          // a rebased start reads 0.0 and perfectly on schedule while the oven
+          // sits 15 degC below the profile: the corridor cannot see a deficit
+          // it was just re-zeroed against. STEP_MISS_C then measures each step
+          // against its OWN target only, so every heating step may quietly
+          // shed up to 15 degC and the losses ADD -- three of them on the
+          // default profile, and a peak reached 45 degC cold with no fault
+          // raised and a corridor that read clean the whole way. This is
+          // REWORK_NOTES.md 7.7's "no fault, and a log that looks perfect",
+          // and it is also why the setpoint trace stepped down to meet the
+          // temperature at each transition instead of holding the profile.
+          //
+          // Anchoring carries the deficit forward instead: the step opens with
+          // progress negative, the badly-behind arm asks for two levels, and
+          // the oven is driven to make it up -- still under the step's own
+          // fast rate bound, which is now enforced in every branch.
+          //
+          // The comment on defaultSteps above already asserted this ("the
+          // remaining steps start from the previous step's target"); only the
+          // code disagreed.
+          //
+          // Upward steps only, and only while the anchor is at or above the
+          // measurement -- that is precisely the undershoot case, where the
+          // oven is short of where the last step was meant to leave it and
+          // the shortfall is the step's to make up. The second test is what
+          // stops the anchor cutting the other way: after a passive cooling
+          // step that never got down to its target, anchoring an up-ramp at
+          // that target would inflate delta instead of holding it, handing the
+          // step exactly the undeclared time this is meant to deny it.
+          // Cooling steps never anchor at all; the open door is the actuator
+          // and the controller cannot be held to a corridor it cannot drive.
+          if (activeProfile.steps[activeStep].targetTemp > step.targetTemp &&
+              (float)step.targetTemp >= aktSystemTemperature)
+            stepStartTemp    = (float)step.targetTemp;
+          else
+            stepStartTemp    = aktSystemTemperature;
           stepStartedTime_ms = time_ms;
           lastLevelWindow    = relayWindowSeq;
           stepExtending      = false;
