@@ -222,7 +222,7 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 // enough to respond to it.
 //
 // Why 2 and not more: the peak step of a lead-free profile is short. The
-// default 220->243 degC step has a 21 s minimum, which is 3 decisions at 2
+// default 220->240 degC step has a 21 s minimum, which is 3 decisions at 2
 // windows but only 1 at 4 -- effectively open-loop through reflow, which is
 // the last place to give up feedback. 2 windows is the slowest value that
 // still closes the loop on the shortest step that matters.
@@ -401,14 +401,19 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 //
 // This, not the per-step cap, is the constraint that actually limits the
 // feature. Time above liquidus is what grows intermetallics and damages parts,
-// and the default profile already spends 61.8 s above 217 degC when its steps
-// run to their slow bounds -- against a 60-90 s paste spec, so about 28 s of
-// headroom for the whole run. Charging only above-liquidus extension time
-// against 25 s keeps even a fully extended run near 87 s, still inside spec.
+// and the default profile spends 60.2-76.8 s above 217 degC on its own, before
+// any extension -- see the arithmetic at defaultSteps. Against a 60-90 s paste
+// spec that leaves 13.2 s of headroom at the slow bounds, so the budget is
+// 12 s: a fully extended run lands at 88.8 s, still inside spec.
 //
-// Uncapped, extensions on the 220 and 243 degC steps would take it to 154 s.
+// It was 25 s, which was correct for the profile that existed then -- a
+// triangular 243 degC apex spending 61.8 s above liquidus. Adding the peak
+// dwell spent most of that headroom, and the dwell is the better use of it:
+// it is time at temperature by design rather than time granted to a step that
+// is struggling. Uncapped, extensions on the steps above 217 would reach
+// 154 s.
 #define LIQUIDUS_C              217.0f
-#define RUN_EXTEND_LIQ_S        25.0f
+#define RUN_EXTEND_LIQ_S        12.0f
 
 // "Still gaining" -- measured as a temperature DIFFERENCE ACROSS A WINDOW, and
 // never as an instantaneous rate.
@@ -977,7 +982,7 @@ void loadProfile(unsigned int targetProfile) {
 // are the right thing to start from -- and the reason the corridor law arrives
 // already tuned.
 //
-// Steps 3-5 are the controlled cooldown. They are stored and run, but
+// Steps 4-6 are the controlled cooldown. They are stored and run, but
 // COOLDOWN_MAX_LEVEL holds their power at zero, so today they act as timed
 // coast-down segments.
 void makeDefaultProfile() {
@@ -990,10 +995,45 @@ void makeDefaultProfile() {
   // remaining steps start from the previous step's target rather than from
   // ambient, and their durations are the thing that matters chemically, so
   // they keep the measured seconds.
+  //
+  // The peak is a plateau, not an apex.
+  //
+  // It used to be a single 243 degC step followed straight by the descent, so
+  // the oven touched peak and turned around. With the probe in the air the
+  // board lags the reading in magnitude AND in time, so a triangular apex
+  // gives the joints the least of both: the air peaks and falls while the
+  // board is still climbing toward a number it never reaches. The 2026-09-03
+  // run ended with the air at 221 degC and the solder unmelted.
+  //
+  // A dwell trades apex height for time at temperature, which is what
+  // actually transfers heat into a board, so the peak comes down to 240 as it
+  // gains a hold. Lower is also kinder to parts -- plenty are rated 245-260
+  // peak -- and 3 degC of air temperature was never what the joints saw.
+  //
+  // Time above liquidus, which is the constraint that bounds all of this
+  // (217 degC, 60-90 s for SAC305):
+  //
+  //   step 1  170->220  3/50 of the step is above 217   1.9 s ..  3.8 s
+  //   step 2  220->240  entirely above                 21.0 s .. 28.0 s
+  //   step 3  dwell     entirely above                 15.0 s   (see below)
+  //   step 4  240->220  entirely above                 21.0 s .. 28.0 s
+  //   step 5  220->150  3/70 of the step is above      1.3 s ..  1.9 s
+  //                                                   -----------------
+  //                                                   60.2 s .. 76.8 s
+  //
+  // Both ends now sit inside the spec. The old profile ran 45.2 s at its fast
+  // bounds, i.e. under the 60 s minimum -- so the dwell fixes an existing hole
+  // at the fast end as well as adding the hold.
+  //
+  // The dwell contributes exactly its minDuration, not a range: `reached` is
+  // unconditionally true for a dwell step (delta is zero, so isDwell), and the
+  // step therefore advances the moment minMet. Its maxDuration is a watchdog
+  // and nothing else.
   static const Step_t defaultSteps[] = {
     { 170,  72,  94, BOUND_RATE     },  // 0.72-0.94 degC/s
     { 220,  31,  64, BOUND_DURATION },
-    { 243,  21,  28, BOUND_DURATION },
+    { 240,  21,  28, BOUND_DURATION },
+    { 240,  15,  25, BOUND_DURATION },  // dwell at peak; holds for 15 s
     { 220,  21,  28, BOUND_DURATION },
     { 150,  30,  45, BOUND_DURATION },
     {  30,  20,  30, BOUND_DURATION },
@@ -1577,7 +1617,7 @@ void setup() {
   // Steps arrive as one "target,lo,hi[,unit]" record per step, semicolon
   // separated. The optional unit is "s" for seconds (the default) or "r" for
   // degC/s, which is what selects the step's bound type:
-  //   steps=170,0.72,0.94,r;220,31,64;243,21,28
+  //   steps=170,0.72,0.94,r;220,31,64;240,21,28;240,15,25
   // Both bounds ascend in whatever unit they use, as a datasheet prints them.
   // The whole list is replaced or none of it is -- a half-applied profile would
   // be a corridor that no longer joins up.
@@ -2303,8 +2343,18 @@ void loop()
           // step exactly the undeclared time this is meant to deny it.
           // Cooling steps never anchor at all; the open door is the actuator
           // and the controller cannot be held to a corridor it cannot drive.
-          if (activeProfile.steps[activeStep].targetTemp > step.targetTemp &&
-              (float)step.targetTemp >= aktSystemTemperature)
+          //
+          // A step repeating the previous target is a dwell by intent, and it
+          // anchors unconditionally so that delta is exactly zero and isDwell
+          // recognises it. Taken from the measurement instead, a dwell entered
+          // a few degrees low becomes a tiny ramp -- and entered a few degrees
+          // high becomes a *cooling* step, with dir negative and
+          // COOLDOWN_MAX_LEVEL holding the power down -- so the dwell
+          // regulator that holds the peak would never run at all.
+          const int16_t nextTarget = activeProfile.steps[activeStep].targetTemp;
+          if (nextTarget == step.targetTemp ||
+              (nextTarget > step.targetTemp &&
+               (float)step.targetTemp >= aktSystemTemperature))
             stepStartTemp    = (float)step.targetTemp;
           else
             stepStartTemp    = aktSystemTemperature;
@@ -2326,8 +2376,14 @@ void loop()
           // Safe for the same reason the full-duty entry at run start is: the
           // approach clamp is ungated, re-tests every 100 ms, and takes the
           // power straight back off the moment arrival is assured.
-          if ((float)activeProfile.steps[activeStep].targetTemp
-              > aktSystemTemperature + DWELL_BAND_C)
+          //
+          // Keyed on the profile's intent rather than on the measurement,
+          // because a dwell must NOT get this. The approach clamp excludes
+          // dwell steps, so nothing would take the power back off inside the
+          // 100 ms pass -- the dwell regulator would have to walk it down at
+          // one level per control interval, and 8 s of full duty at the peak
+          // is 8 degC of overshoot on the step that can least afford it.
+          if (nextTarget > step.targetTemp)
           {
             powerLevel = POWER_LEVELS - 1;
           }
