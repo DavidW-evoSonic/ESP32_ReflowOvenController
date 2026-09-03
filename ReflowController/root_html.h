@@ -29,6 +29,11 @@ const char ROOT_HTML[] PROGMEM = R"=====(
       #r_heat.on  .value { color: #dc2626; }
       #r_heat.off .value { color: #a1a1aa; }
 
+      /* An extension is a departure from the profile the step declared, so it
+         gets its own colour rather than hiding in the state name. */
+      #r_state.ext { background: #fffbeb; }
+      #r_state.ext .value { color: #b45309; }
+
       /* No fresh /status: the numbers on screen are history, so say so. */
       #readout.stale { opacity: .45; }
       #readout.stale .value::after { content: " ?"; color: #a1a1aa; }
@@ -148,11 +153,19 @@ const char ROOT_HTML[] PROGMEM = R"=====(
              // Driven off every poll, in every state, so it is never
              // showing a number the controller has moved on from.
              $('#readout').removeClass('stale');
-             $('#v_state').text(data.state);
-             $('#v_step').html(data.steps > 0 && data.state!="Ready"
+             $('#v_state').text(data.extending ? "EXTENDING" : data.state);
+             $('#r_state').toggleClass('ext', !!data.extending);
+             // Once any extension time is on the clock it stays on the
+             // sub-line for the rest of the run, including through Complete:
+             // a stretched profile must not report as an ordinary one.
+             var stepTxt = data.steps > 0 && data.state!="Ready"
                  && data.state!="Complete"
                  ? "step "+(data.step+1)+" of "+data.steps
-                 : "&nbsp;");
+                 : "";
+             if (data.extended > 0)
+                 stepTxt += (stepTxt ? " \u00B7 " : "")
+                          + "+"+Math.round(data.extended)+"s extended";
+             $('#v_step').html(stepTxt || "&nbsp;");
              $('#v_temp').text(data.temp.toFixed(1));
              $('#v_rate').text((data.dt>=0?"+":"\u2212")
                  + Math.abs(data.dt).toFixed(2) + " \u00B0C/s");

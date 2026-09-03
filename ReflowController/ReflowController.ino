@@ -258,6 +258,93 @@
 // ran the whole profile through to Complete without ever warming the oven.
 #define STEP_MISS_C         15.0f
 
+// --- Step extension -------------------------------------------------------
+//
+// A heating step that runs out its slow bound short of target, but is still
+// genuinely climbing, is EXTENDED rather than advanced: it keeps running, with
+// its rate bounds still in force and only its duration watchdog suspended,
+// until it actually reaches the target.
+//
+// This closes the gap between the two outcomes that used to be the only ones.
+// Miss by more than STEP_MISS_C and the oven latched dead; miss by 14 degC and
+// the step advanced in silence, with the deficit rebased into the next step at
+// step entry -- no fault, and a log that looks perfect (REWORK_NOTES 7.7).
+
+// Extension is for the "nearly made it" case only.
+//
+// A step still more than STEP_MISS_C short when its slow bound expires is not
+// a slow oven, it is the dead-or-weak element case, and it must keep faulting
+// on exactly the timing it always did. Without this gate a partially failed
+// element -- one element open, low mains, a door ajar -- would be extended
+// instead of faulted, because it does still climb, just not enough. On the
+// default step 0 that would push detection from 180 s out to 542 s of a
+// half-failed mains heater at full power.
+//
+// Gating here means the extension covers precisely the 0..15 degC window that
+// used to advance silently, and nothing else.
+#define STEP_EXTEND_ENTRY_C     STEP_MISS_C
+
+// Absolute per-step cap, seconds.
+//
+// Deliberately not a multiple of maxDuration: that unit is largest exactly
+// where extension matters least (361 s on the default step 0, against 28 s on
+// the peak) and is bounded by nothing chemical. Derived instead from the work
+// to be done -- closing a STEP_EXTEND_ENTRY_C gap at the rate floor below
+// takes 37-42 s on every heating step of the default profile.
+#define STEP_EXTEND_CAP_S       45.0f
+
+// Run-wide extension budget, seconds. Per-step caps compose with the step
+// count, and MAX_STEPS is 8, so a per-step cap on its own bounds nothing
+// useful. A step that ends short also rebases the next step's start on the
+// measured temperature, shrinking its delta while its durations stay fixed --
+// so an extension makes the following step harder, and more likely to extend
+// in turn. This is what stops that cascading.
+#define RUN_EXTEND_BUDGET_S     60.0f
+
+// Run-wide budget for extension time spent above liquidus, seconds.
+//
+// This, not the per-step cap, is the constraint that actually limits the
+// feature. Time above liquidus is what grows intermetallics and damages parts,
+// and the default profile already spends 61.8 s above 217 degC when its steps
+// run to their slow bounds -- against a 60-90 s paste spec, so about 28 s of
+// headroom for the whole run. Charging only above-liquidus extension time
+// against 25 s keeps even a fully extended run near 87 s, still inside spec.
+//
+// Uncapped, extensions on the 220 and 243 degC steps would take it to 154 s.
+#define LIQUIDUS_C              217.0f
+#define RUN_EXTEND_LIQ_S        25.0f
+
+// "Still gaining" -- measured as a temperature DIFFERENCE ACROSS A WINDOW, and
+// never as an instantaneous rate.
+//
+// aktSystemTemperatureRamp is a 1 s difference of a 1 s rolling mean, so it
+// carries roughly sqrt(2)/sqrt(10) of the per-read noise: about 0.045 degC/s
+// of sigma on this hardware (REWORK_NOTES 7.1). Thresholding that directly is
+// a coin flip evaluated at 10 Hz, and across a 45 s extension noise alone
+// would hold the test open indefinitely.
+//
+// Differencing the temperature across a whole window telescopes instead: an
+// ADC excursion that inflates one endpoint inflates the next window's start by
+// the same amount, so a spike can shift one boundary but cannot manufacture
+// sustained gain. Only a steady bias of this size could, and a bias that large
+// would walk the absolute reading into TEMP_PLAUSIBLE_MAX_C on its own.
+//
+// Do NOT reuse MEASURE_MIN_RATE_C_S (0.05) here. That is about one sigma of
+// this noise, and it answers a different question at a different operating
+// point.
+#define STEP_EXTEND_GAIN_WINDOW_MS 20000
+
+// The floor scales with the step's own slow bound -- "at least half the rate
+// the step itself demands" -- under an absolute 0.20 degC/s, which is 4-5
+// sigma of the ramp noise. That yields 0.36, 0.39 and 0.41 degC/s on the
+// default profile's three heating steps.
+//
+// Note this test is a weak limiter by nature: at full power the oven really is
+// gaining right up to thermal equilibrium, with the rate decaying through 0.4,
+// 0.2, 0.1 degC/s. The caps above do most of the safety work, so do not size
+// them on the assumption that gaining will end most extensions early.
+#define STEP_EXTEND_MIN_RATE_C_S   0.20f
+
 // A profile may not start from a warm chamber.
 //
 // A hot oven is a hazard to load -- reaching into it is how you get burnt, and
@@ -456,6 +543,18 @@ float heaterSetpoint;
 float corridorLow;      // degC, coolest the oven may be right now
 float corridorHigh;     // degC, hottest it may be
 uint8_t activeStep = 0; // index into activeProfile.steps
+// True while the active step is running past its maxDuration because it is
+// still climbing toward target. File scope rather than a control-loop static
+// because the /status handler is a lambda in setup() and cannot see those --
+// and an extension has to show up in a log, or it is just an inexplicably
+// long step.
+bool stepExtending = false;
+// Run-scoped extension budgets, seconds. File scope for the same reason as
+// stepExtending: /status reports the total, because an extension is a
+// departure from the profile the step declared and must never be silent even
+// when nothing latches a fault.
+float runExtendUsed_s = 0.0f;   // total extension time this run
+float runExtendLiq_s  = 0.0f;   // ... of which was spent above liquidus
 float stepStartTemp;    // measured temperature when the step began
 uint8_t powerLevel = 0; // 0..POWER_LEVELS-1, what the corridor law is asking for
 
@@ -939,17 +1038,19 @@ void setup() {
   });
   server.on("/status", []() {
     server.sendHeader("Cache-Control","no-cache");
-    char buffer[448];
+    char buffer[512];
     unsigned long time = (esp_timer_get_time()-cycleStartTime)/1000;
     snprintf(buffer,sizeof(buffer),
       "{\"time\": %lu, \"temp\": %.2f, \"dt\": %.2f, \"setpoint\": %.2f,"
       " \"low\": %.2f, \"high\": %.2f, \"power\": %.2f, \"step\": %d,"
       " \"steps\": %d, \"lag\": %.1f, \"openDoor\": %d, \"heating\": %d,"
+      " \"extending\": %d, \"extended\": %.0f,"
       " \"state\": \"%s\", \"fault\": \"%s\"}",
       time, aktSystemTemperature, aktSystemTemperatureRamp, heaterSetpoint,
       corridorLow, corridorHigh,
       (float)powerHeater*100.0f/255.0f, activeStep, activeProfile.stepCount,
       thermalLagSec, openDoorPrompt ? 1 : 0, heaterOn ? 1 : 0,
+      stepExtending ? 1 : 0, runExtendUsed_s,
       currentStateToString(), globalErrorText);
     server.send(200, "application/json", buffer);
   });
@@ -1423,6 +1524,11 @@ void loop()
     {
       stateChanged = true;
       previousState = currentState;
+      // Any transition ends an extension. This has to live here rather than in
+      // the Running block, because /stop assigns currentState = Complete
+      // directly and never passes through it -- which would otherwise leave
+      // /status claiming an extension that stopped when the run did.
+      stepExtending = false;
     }
     static uint64_t stepStartedTime_ms = time_ms;
     static uint64_t lastLevelUpdate_ms  = time_ms;
@@ -1430,6 +1536,14 @@ void loop()
     static bool     awaitingPeakBeep    = false;
     static uint64_t coolStepEntered_ms  = 0;
     static uint64_t notClimbingSince_ms = 0;
+    // Step extension bookkeeping. The gain reference rolls for the whole step,
+    // not just during an extension, so the eligibility decision at maxDuration
+    // already has a full window of history behind it rather than needing a
+    // separate and weaker entry test.
+    static uint64_t stepGainRef_ms      = 0;
+    static float    stepGainRefTemp     = 0.0f;
+    static float    stepExtendStart_s   = 0.0f;  // elapsed_s when it began
+    static bool     stepGaining         = true;  // verdict, one per window
 
     // A latched fault must not be able to reach Complete along the success
     // path. reportError() deliberately does not touch currentState -- it is
@@ -1460,6 +1574,12 @@ void loop()
         powerLevel         = 0;
         cooldownAnnounced  = false;
         awaitingPeakBeep   = false;
+        stepGainRef_ms     = time_ms;
+        stepGainRefTemp    = aktSystemTemperature;
+        stepGaining        = true;
+        // Run-scoped, so these reset here and nowhere else.
+        runExtendUsed_s    = 0.0f;
+        runExtendLiq_s     = 0.0f;
       }
 
       const Step_t &step = activeProfile.steps[activeStep];
@@ -1646,8 +1766,93 @@ void loop()
       bool reached  = isDwell ||
                       (dir > 0.0f ? (projectedTemp >= step.targetTemp)
                                   : (aktSystemTemperature <= step.targetTemp));
-      bool minMet   = elapsed_s >= minDur;
-      bool timedOut = elapsed_s >= maxDur;
+      bool minMet  = elapsed_s >= minDur;
+      bool overrun = (maxDur > 0.0f) && (elapsed_s >= maxDur);
+
+      // Progress across a window, rolled through the whole step.
+      //
+      // The verdict is taken ONLY when a whole window has elapsed, and held
+      // between times. Testing it continuously against a window that grows
+      // from zero would defeat the point: one second in it asks for 0.36 degC
+      // in 1 s, which is an instantaneous rate test carrying exactly the noise
+      // the window length was chosen to reject. Held this way, an extension is
+      // re-judged roughly twice inside its cap, on evidence that has actually
+      // accumulated.
+      //
+      // It starts optimistic, so a step whose maxDuration is shorter than the
+      // window can enter an extension on no evidence. That is bounded: the
+      // entry gate has already established the oven is within
+      // STEP_EXTEND_ENTRY_C, and the first real verdict lands 20 s in, well
+      // inside STEP_EXTEND_CAP_S and the liquidus budget.
+      float gainWindow_s = (time_ms - stepGainRef_ms) / 1000.0f;
+      float gainFloor    = fmaxf(STEP_EXTEND_MIN_RATE_C_S,
+                                 (maxDur > 0.0f)
+                                   ? 0.5f * fabsf(delta) / maxDur : 0.0f);
+      if (gainWindow_s * 1000.0f >= STEP_EXTEND_GAIN_WINDOW_MS)
+      {
+        stepGaining     = (aktSystemTemperature - stepGainRefTemp)
+                          >= gainFloor * gainWindow_s;
+        stepGainRef_ms  = time_ms;
+        stepGainRefTemp = aktSystemTemperature;
+      }
+      bool gaining = stepGaining;
+
+      float miss_C = (float)step.targetTemp - aktSystemTemperature;
+
+      // Enter an extension: overrun its slow bound, short of target, heating,
+      // still genuinely climbing, and nearly there.
+      //
+      // `reached` is the projection, so this never fights the deliberate early
+      // cut: a step that projects to arrive is not short, and ends normally
+      // through the ordinary advance below. A dead element is short and NOT
+      // gaining, so it never gets here either -- it falls through to the
+      // STEP_MISS_C check in the same window it always did.
+      if (overrun && !reached && !isDwell && dir > 0.0f && gaining &&
+          miss_C <= STEP_EXTEND_ENTRY_C && !stepExtending &&
+          runExtendUsed_s < RUN_EXTEND_BUDGET_S &&
+          runExtendLiq_s  < RUN_EXTEND_LIQ_S)
+      {
+        stepExtending     = true;
+        stepExtendStart_s = elapsed_s;
+        Serial.printf("Step %u extended at %.0fs, %.1fC short of %dC\n",
+                      activeStep, elapsed_s, miss_C, step.targetTemp);
+      }
+
+      if (stepExtending)
+      {
+        float ext_s = elapsed_s - stepExtendStart_s;
+        // Charged per 100 ms pass. Only time actually spent above liquidus
+        // counts against the tighter budget -- that is the exposure that
+        // damages the board, and a long sub-liquidus extension does not.
+        runExtendUsed_s += 0.1f;
+        if (aktSystemTemperature >= LIQUIDUS_C) runExtendLiq_s += 0.1f;
+
+        if (ext_s >= STEP_EXTEND_CAP_S ||
+            runExtendUsed_s >= RUN_EXTEND_BUDGET_S ||
+            runExtendLiq_s  >= RUN_EXTEND_LIQ_S)
+        {
+          reportError("Extended step never reached target");
+          stepExtending = false;  // fall through to the ordinary advance
+        }
+        else if (!gaining)
+        {
+          // Stopped climbing: the oven has given what it can. Faulting on a
+          // miss of a degree or two would be a new false alarm where today the
+          // step simply advances, and the projection catches nearly everything
+          // that close anyway -- at the default 20 s lag even 0.05 degC/s of
+          // climb puts projectedTemp over the target.
+          stepExtending = false;
+          if (miss_C > DWELL_BAND_C)
+          {
+            reportError("Extended step stalled short of target");
+          }
+        }
+      }
+
+      // Suspending the duration watchdog is the whole of what an extension
+      // does. Its rate bounds stayed in force throughout, by way of the
+      // hoisted fast-bound clamp above.
+      bool timedOut = overrun && !stepExtending;
 
       if ((minMet && reached) || timedOut)
       {
@@ -1673,6 +1878,10 @@ void loop()
           stepStartTemp      = aktSystemTemperature;
           stepStartedTime_ms = time_ms;
           lastLevelUpdate_ms = time_ms;
+          stepExtending      = false;
+          stepGainRef_ms     = time_ms;
+          stepGainRefTemp    = aktSystemTemperature;
+          stepGaining        = true;
 
           // First cooling step: the oven cannot cool itself, so ask for the
           // door -- but not yet. The coast is still carrying the oven up to
