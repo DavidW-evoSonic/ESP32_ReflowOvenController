@@ -359,19 +359,26 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 // Half of full demand, rounded down. At POWER_LEVELS 5 that is level 2 of 4.
 #define HEAT_STALL_MIN_LEVEL   ((POWER_LEVELS - 1) / 2)
 
-// Extension is for the "nearly made it" case only.
+// There is deliberately no distance gate on entering an extension.
 //
-// A step still more than STEP_MISS_C short when its slow bound expires is not
-// a slow oven, it is the dead-or-weak element case, and it must keep faulting
-// on exactly the timing it always did. Without this gate a partially failed
-// element -- one element open, low mains, a door ajar -- would be extended
-// instead of faulted, because it does still climb, just not enough. On the
-// default step 0 that would push detection from 180 s out to 542 s of a
-// half-failed mains heater at full power.
+// There used to be one: STEP_EXTEND_ENTRY_C, set to STEP_MISS_C, so only a
+// step within 15 degC of target could be extended. The argument was that
+// anything further out is the dead-or-weak element case and must keep faulting
+// on its original timing. That argument was wrong twice over, and the
+// 2026-09-03 run is what showed it -- step 3 was climbing at 0.27 degC/s,
+// 25 degC short, and got "Oven not heating" while it was demonstrably heating.
 //
-// Gating here means the extension covers precisely the 0..15 degC window that
-// used to advance silently, and nothing else.
-#define STEP_EXTEND_ENTRY_C     STEP_MISS_C
+// Wrong first because distance-to-target does not identify a dead element;
+// gaining does, and the gain test below already applies it. A dead element is
+// not gaining at any distance, so the gate rejected nothing that the gain test
+// would have let through. Wrong second because HEAT_STALL_WINDOW_MS above is
+// the actual dead-element detector: 30 s of demanded power with under 2 degC
+// of rise, independent of step timing and confirmed on hardware at 30.1 s. The
+// gate was guarding a case that was already covered twice.
+//
+// What bounds an extension is therefore time, not distance:
+// STEP_EXTEND_CAP_S per step, RUN_EXTEND_BUDGET_S per run, and
+// RUN_EXTEND_LIQ_S of that above liquidus.
 
 // Absolute per-step cap, seconds.
 //
@@ -423,10 +430,21 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 // point.
 #define STEP_EXTEND_GAIN_WINDOW_MS 20000
 
-// The floor scales with the step's own slow bound -- "at least half the rate
-// the step itself demands" -- under an absolute 0.20 degC/s, which is 4-5
-// sigma of the ramp noise. That yields 0.36, 0.39 and 0.41 degC/s on the
-// default profile's three heating steps.
+// An absolute floor, and only an absolute floor.
+//
+// It used to be fmaxf(0.20, 0.5*|delta|/maxDuration) -- "at least half the rate
+// the step itself demands" -- which came out at 0.36-0.41 degC/s on the default
+// profile's heating steps. That asked the wrong question at this decision
+// point. By the time a step is overrun and short we have already established
+// that it is not meeting the profile's demand; what remains to decide is
+// whether the oven is still climbing or has stalled, and the demanded rate
+// says nothing about that. On the 2026-09-03 run step 3 was rising a genuine
+// 0.27 degC/s and the relative term called it stalled.
+//
+// 0.20 degC/s is measured across STEP_EXTEND_GAIN_WINDOW_MS, not
+// instantaneously. Over a 20 s window the endpoint noise is about 0.5 degC,
+// so 0.025 degC/s of sigma -- the floor sits at roughly 8 sigma, while still
+// being an order of magnitude below any rate the profile asks for.
 //
 // Note this test is a weak limiter by nature: at full power the oven really is
 // gaining right up to thermal equilibrium, with the rate decaying through 0.4,
@@ -2147,9 +2165,7 @@ void loop()
       // STEP_EXTEND_ENTRY_C, and the first real verdict lands 20 s in, well
       // inside STEP_EXTEND_CAP_S and the liquidus budget.
       float gainWindow_s = (time_ms - stepGainRef_ms) / 1000.0f;
-      float gainFloor    = fmaxf(STEP_EXTEND_MIN_RATE_C_S,
-                                 (maxDur > 0.0f)
-                                   ? 0.5f * fabsf(delta) / maxDur : 0.0f);
+      float gainFloor    = STEP_EXTEND_MIN_RATE_C_S;
       if (gainWindow_s * 1000.0f >= STEP_EXTEND_GAIN_WINDOW_MS)
       {
         stepGaining     = (aktSystemTemperature - stepGainRefTemp)
@@ -2162,7 +2178,8 @@ void loop()
       float miss_C = (float)step.targetTemp - aktSystemTemperature;
 
       // Enter an extension: overrun its slow bound, short of target, heating,
-      // still genuinely climbing, and nearly there.
+      // and still genuinely climbing. How far short is deliberately not asked
+      // -- see the note where STEP_EXTEND_ENTRY_C used to be defined.
       //
       // `reached` is the projection, so this never fights the deliberate early
       // cut: a step that projects to arrive is not short, and ends normally
@@ -2170,7 +2187,7 @@ void loop()
       // gaining, so it never gets here either -- it falls through to the
       // STEP_MISS_C check in the same window it always did.
       if (overrun && !reached && !isDwell && dir > 0.0f && gaining &&
-          miss_C <= STEP_EXTEND_ENTRY_C && !stepExtending &&
+          !stepExtending &&
           runExtendUsed_s < RUN_EXTEND_BUDGET_S &&
           runExtendLiq_s  < RUN_EXTEND_LIQ_S)
       {
@@ -2218,14 +2235,27 @@ void loop()
 
       if ((minMet && reached) || timedOut)
       {
-        // Timed out a long way short on a heating step: this is not a slow
-        // oven, it is an element that is not heating. Nothing else looks like
-        // this, and without the check a dead element runs the whole profile
-        // through to Complete having never warmed anything.
+        // Timed out a long way short on a heating step. Without a check here
+        // a dead element runs the whole profile through to Complete having
+        // never warmed anything.
+        //
+        // But "short of target" and "not heating" are different claims, and
+        // the old message asserted the second from evidence for only the
+        // first. On the 2026-09-03 run it reported "Oven not heating" about an
+        // oven climbing at 0.27 degC/s -- the element was fine; the controller
+        // had spent 21 s of a 28 s step getting the power back up, and then
+        // refused to wait. Wrong diagnosis, and it sent the operator looking
+        // at the element.
+        //
+        // A gaining step reaching here has exhausted its extension budget,
+        // which is a scheduling failure and says nothing about the element.
+        // Only a step that is short AND not climbing is evidence of one.
         if (timedOut && !reached && dir > 0.0f &&
             (step.targetTemp - aktSystemTemperature) > STEP_MISS_C)
         {
-          reportError("Oven not heating: step timed out short of target");
+          reportError(gaining
+            ? "Out of extension budget, still short of target"
+            : "Oven not heating: step timed out short of target");
         }
 
         activeStep++;
