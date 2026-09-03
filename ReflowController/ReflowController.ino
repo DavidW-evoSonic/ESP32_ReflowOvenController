@@ -414,6 +414,12 @@ const char * globalErrorText = "";
 
 // Heater demand, 0..255, consumed by relayDriver().
 volatile uint8_t  powerHeater=0;
+// What relayDriver() last actually did to the contact, as opposed to what was
+// demanded of it. The two differ whenever a fault or a stale heartbeat holds
+// the relay off, and they differ constantly during normal running: demand is
+// an average over the window, this is the instantaneous state. /status reports
+// it so the readout can show the element rather than the intent.
+volatile bool     heaterOn=false;
 // Last time the control loop ran, ms. relayDriver() will not close the relay
 // without a recent one -- see RELAY_HEARTBEAT_HOLD_MS.
 volatile uint64_t controlHeartbeat_ms=0;
@@ -601,8 +607,8 @@ void relayDriver()
     if (onTime > RELAY_WINDOW_MS - RELAY_MIN_OFF_MS) onTime = RELAY_WINDOW_MS;
   }
 
-  digitalWrite(HEATER,
-    (!globalError && !heartbeatStale && windowElapsed < onTime) ? HIGH : LOW);
+  heaterOn = (!globalError && !heartbeatStale && windowElapsed < onTime);
+  digitalWrite(HEATER, heaterOn ? HIGH : LOW);
   windowElapsed += RELAY_TICK_MS;
 }
 
@@ -933,17 +939,17 @@ void setup() {
   });
   server.on("/status", []() {
     server.sendHeader("Cache-Control","no-cache");
-    char buffer[384];
+    char buffer[448];
     unsigned long time = (esp_timer_get_time()-cycleStartTime)/1000;
     snprintf(buffer,sizeof(buffer),
       "{\"time\": %lu, \"temp\": %.2f, \"dt\": %.2f, \"setpoint\": %.2f,"
       " \"low\": %.2f, \"high\": %.2f, \"power\": %.2f, \"step\": %d,"
-      " \"steps\": %d, \"lag\": %.1f, \"openDoor\": %d,"
+      " \"steps\": %d, \"lag\": %.1f, \"openDoor\": %d, \"heating\": %d,"
       " \"state\": \"%s\", \"fault\": \"%s\"}",
       time, aktSystemTemperature, aktSystemTemperatureRamp, heaterSetpoint,
       corridorLow, corridorHigh,
       (float)powerHeater*100.0f/255.0f, activeStep, activeProfile.stepCount,
-      thermalLagSec, openDoorPrompt ? 1 : 0,
+      thermalLagSec, openDoorPrompt ? 1 : 0, heaterOn ? 1 : 0,
       currentStateToString(), globalErrorText);
     server.send(200, "application/json", buffer);
   });
