@@ -86,7 +86,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             chartdata = new google.visualization.DataTable()
             chartdata.addColumn('number', 'Seconds');
             chartdata.addColumn({type: 'string', role: 'annotation'});
-            chartdata.addColumn('number', "Temperatur");
+            chartdata.addColumn('number', "Temperature");
             chartdata.addColumn('number', "Setpoint");
             chartdata.addColumn('number', "Corridor low");
             chartdata.addColumn('number', "Corridor high");
@@ -119,7 +119,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
           vAxes: {
             // Adds titles to each axis.
             0: {
-              title: 'Temps (°C)',
+              title: 'Temperature (°C)',
               viewWindow: {
                 max:300,
                 min:0
@@ -454,7 +454,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         });
         $('#export').click(function () {
             var csvFormattedDataTable = google.visualization.dataTableToCsv(chartdata).replace(/[,]/g,";");
-            var encodedUri = 'data:application/csv;charset=utf-8,' + "Time;State;Temperatur;Setpoint;Power\n" +encodeURIComponent(csvFormattedDataTable);
+            var encodedUri = 'data:application/csv;charset=utf-8,' + "Time;State;Temperature;Setpoint;Power\n" +encodeURIComponent(csvFormattedDataTable);
             this.href = encodedUri;
             this.download = 'Reflow_'+(new Date().toISOString().substring(0, 16).replace(/[\-:T]/g,"_"))+'.csv';
             this.target = '_blank';
