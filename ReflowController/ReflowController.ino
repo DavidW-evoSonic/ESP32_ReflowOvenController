@@ -373,9 +373,39 @@ static_assert(ONTIME_FOR_LEVEL(POWER_LEVELS - 2)
 // The climb has to be real for the division to mean anything.
 #define MEASURE_MIN_RATE_C_S    0.05f
 
-// Abort if the oven runs this far above the corridor: a welded relay contact or
-// a shorted drive transistor looks like this, and nothing else does.
+// Abort if the oven runs this far above the corridor WHILE STILL CLIMBING: a
+// welded relay contact or a shorted drive transistor looks like this.
+//
+// "And nothing else does" was wrong, and a completed run proved it. The gap
+// alone is not evidence of anything on a COOLING step, because that corridor
+// is a timer -- the note at defaultSteps already says a cooling step's
+// declared duration says nothing about where the temperature is. The last
+// step drives the corridor from 150 to 30 degC in 20-30 s; the oven coasts
+// down far slower than that, so the gap opens past 100 degC on a healthy oven
+// every time. A board-mounted probe widens it further, since a board sheds
+// heat far more slowly than the air probe this was sized against.
+//
+// So the run ended in "Temperature is Way to HOT!!!!!" with the relay open,
+// the element cold and the oven falling at 1.8 degC/s -- a hardware
+// accusation built from evidence for a schedule miss. That is the same
+// mistake as the "Oven not heating" misdiagnosis, which was fixed by making
+// the test ask the question it was actually claiming to answer.
+//
+// Requiring a climb does that here, and it holds in every state rather than
+// only on heating steps: a welded contact delivers heat nobody asked for, so
+// it climbs. A coast never does.
 #define CORRIDOR_ABORT_C   100.0f
+
+// One positive sample does not make a runaway.
+//
+// The test now reads a rate, so it inherits the rule the rest of this file
+// follows: never decide on an instantaneous one. controlRamp is the 4 s
+// difference (sigma 0.30) rather than the 1 s aktSystemTemperatureRamp
+// (sigma 0.48), and the condition then has to hold continuously. During a
+// 1.8 degC/s coast a single positive reading is 6 sigma; sustained for three
+// seconds at 10 Hz it is not noise. Same settling idea as
+// COOLDOWN_BEEP_SETTLE_MS and MEASURE_PEAK_SETTLE_MS.
+#define CORRIDOR_ABORT_SETTLE_MS 3000
 
 // A heating step that times out on its slow bound this far short of target has
 // not merely run slow -- the element is not heating. The PID build had no such
@@ -2534,12 +2564,24 @@ void loop()
         }
       }
 
-      // Far above the corridor with the heat quantised and bounded: a welded
-      // contact or a shorted drive looks like this and little else does.
-      if (aktSystemTemperature > corridorHigh + CORRIDOR_ABORT_C)
+      // Heat arriving that nothing asked for: far above the corridor AND
+      // still climbing. See CORRIDOR_ABORT_C for why the climb is load-
+      // bearing and the gap on its own is not.
+      static uint64_t corridorAbortSince_ms = 0;
+      if (aktSystemTemperature > corridorHigh + CORRIDOR_ABORT_C &&
+          controlRamp > 0.0f)
       {
-        reportError("Temperature is Way to HOT!!!!!");
+        if (corridorAbortSince_ms == 0) corridorAbortSince_ms = time_ms;
+        else if (time_ms - corridorAbortSince_ms >= CORRIDOR_ABORT_SETTLE_MS)
+        {
+          // Names the observation and the part to look at. The old text
+          // ("Temperature is Way to HOT!!!!!") named neither, so an operator
+          // reading it on a cooling oven had nothing to act on.
+          reportError("Oven still heating with the relay open -- "
+                      "check for a welded relay contact");
+        }
       }
+      else corridorAbortSince_ms = 0;
 
       // The opposite fault, and the one that actually happens: heat demanded
       // and nothing coming back. See HEAT_STALL_WINDOW_MS.
