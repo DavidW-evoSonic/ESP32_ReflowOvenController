@@ -195,10 +195,28 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 // Discrete power levels, 0..POWER_LEVELS-1, evenly spaced to 100%.
 #define POWER_LEVELS   5
 
-// How often the power level is re-evaluated. One relay window: nudging faster
-// than the actuator can express would slew the level across its whole range
-// before a single change reached the oven.
-#define CONTROL_INTERVAL_MS  RELAY_WINDOW_MS
+// How often the power level is re-evaluated, in whole relay windows.
+//
+// One window was too fast. The actuator can express a change that quickly, but
+// the *oven* cannot show it: with a thermal lag around 20 s the loop was
+// deciding four or five times before the result of the first decision reached
+// the thermometer, so it chased its own dead time and never settled.
+//
+// Counted in windows rather than milliseconds, and clocked off relayDriver()'s
+// own window counter, because the two used to run on independent phases --
+// lastLevelUpdate_ms was reset at step entry while the relay window was not.
+// A change landing mid-window is deferred to the next latch, so the effective
+// control period jittered between one and two windows. Now every demand gets
+// exactly CONTROL_WINDOWS whole windows, and the oven sees a stable duty long
+// enough to respond to it.
+//
+// Why 2 and not more: the peak step of a lead-free profile is short. The
+// default 220->243 degC step has a 21 s minimum, which is 3 decisions at 2
+// windows but only 1 at 4 -- effectively open-loop through reflow, which is
+// the last place to give up feedback. 2 windows is the slowest value that
+// still closes the loop on the shortest step that matters.
+#define CONTROL_WINDOWS      2
+#define CONTROL_INTERVAL_MS  (CONTROL_WINDOWS * RELAY_WINDOW_MS)
 
 // Outside the corridor by more than this, the level moves by two rather than
 // one. Recovers from a badly-placed start without making normal tracking jumpy.
@@ -577,6 +595,10 @@ const char * globalErrorText = "";
 
 // Heater demand, 0..255, consumed by relayDriver().
 volatile uint8_t  powerHeater=0;
+// Incremented by relayDriver() each time it latches a new window. The control
+// loop clocks its level updates off this rather than off wall time, so a
+// demand is always held for a whole number of windows -- see CONTROL_WINDOWS.
+volatile uint32_t relayWindowSeq=0;
 // What relayDriver() last actually did to the contact, as opposed to what was
 // demanded of it. The two differ whenever a fault or a stale heartbeat holds
 // the relay off, and they differ constantly during normal running: demand is
@@ -795,6 +817,7 @@ void relayDriver()
   if (windowElapsed >= RELAY_WINDOW_MS)
   {
     windowElapsed = 0;
+    relayWindowSeq++;
     onTime = ((uint32_t)powerHeater * RELAY_WINDOW_MS) / 255;
 
     // Never ask the relay for a pulse (or a gap) too short to be worth a
@@ -1746,7 +1769,7 @@ void loop()
       stepExtending = false;
     }
     static uint64_t stepStartedTime_ms = time_ms;
-    static uint64_t lastLevelUpdate_ms  = time_ms;
+    static uint32_t lastLevelWindow     = 0;
     static bool     cooldownAnnounced   = false;
     static bool     awaitingPeakBeep    = false;
     static uint64_t coolStepEntered_ms  = 0;
@@ -1787,8 +1810,17 @@ void loop()
         activeStep         = 0;
         stepStartTemp      = aktSystemTemperature;
         stepStartedTime_ms = time_ms;
-        lastLevelUpdate_ms = time_ms;
-        powerLevel         = 0;
+        lastLevelWindow    = relayWindowSeq;
+        // Start at full duty, not at zero.
+        //
+        // The oven's thermal inertia is highest when everything in it is cold,
+        // and the corridor law used to have to discover that: from level 0 it
+        // nudged up over two windows before the element saw full power, with
+        // the first of those windows spent entirely off. Beginning at the top
+        // costs nothing -- the very first thing any profile does is a ramp from
+        // ambient, which wants all the heat there is -- and the approach clamp
+        // still takes it straight back to zero the moment arrival is assured.
+        powerLevel         = POWER_LEVELS - 1;
         cooldownAnnounced  = false;
         awaitingPeakBeep   = false;
         stepGainRef_ms     = time_ms;
@@ -1847,9 +1879,9 @@ void loop()
       // Re-evaluate once per relay window. The level is what the actuator can
       // actually express, so moving it faster than the window would just slew
       // it across the whole range before one change reached the oven.
-      if (time_ms - lastLevelUpdate_ms >= CONTROL_INTERVAL_MS)
+      if (relayWindowSeq - lastLevelWindow >= CONTROL_WINDOWS)
       {
-        lastLevelUpdate_ms = time_ms;
+        lastLevelWindow = relayWindowSeq;
 
         int8_t nudge = 0; // in corridor terms: +1 means "make more progress"
 
@@ -1925,35 +1957,52 @@ void loop()
         if (next < 0) next = 0;
         if (next > POWER_LEVELS - 1) next = POWER_LEVELS - 1;
 
-        // Arrival is assured: stop driving and coast in.
-        //
-        // This overrides the corridor, deliberately. The corridor can still be
-        // asking for heat -- being behind on time is exactly when it does --
-        // but if the heat already in the element is enough to reach the target,
-        // any more of it is overshoot. Reaching the target late is a profile
-        // that ran slow; reaching it 20 degC hot is a reflow that cooked the
-        // board, so the corridor loses this argument.
-        //
-        // The step advance below tests the same projection, so most of the time
-        // the step simply ends here. What this clamp catches is the case the
-        // advance cannot: a step that projects to arrive *before* minDuration
-        // has elapsed. The advance is blocked by minMet, the oven is running
-        // hot and early, and without this it would keep driving into the wait.
-        //
-        // It is a clamp and not a latch: if the climb decays and the
-        // projection falls back below the target, the corridor gets its
-        // authority back on the next window and drives again.
-        if (!isDwell && dir > 0.0f && projectedTemp >= step.targetTemp)
-        {
-          next = 0;
-        }
-
-        // Cooling steps are capped, and by default that cap is zero. See
-        // COOLDOWN_MAX_LEVEL: the descent is a coast, not a controlled one,
-        // until someone decides the door interlock question.
-        if (delta < 0.0f && next > COOLDOWN_MAX_LEVEL) next = COOLDOWN_MAX_LEVEL;
-
         powerLevel = (uint8_t)next;
+      }
+
+      // Reductions are not on the control interval. Increases are.
+      //
+      // Slowing the integration to CONTROL_WINDOWS was the point, but these
+      // two are overshoot protection, and deferring protection by a whole
+      // interval is not a trade worth making: at these ramp rates one interval
+      // is 7.5 degC of extra drive on step 0, 12.9 degC on step 1 and 8.8 degC
+      // on step 2 -- worst placed exactly at the peak. So the loop integrates
+      // slowly on the way up and cuts immediately.
+      //
+      // Arrival is assured: stop driving and coast in.
+      //
+      // This overrides the corridor, deliberately. The corridor can still be
+      // asking for heat -- being behind on time is exactly when it does -- but
+      // if the heat already in the element is enough to reach the target, any
+      // more of it is overshoot. Reaching the target late is a profile that ran
+      // slow; reaching it 20 degC hot is a reflow that cooked the board, so the
+      // corridor loses this argument.
+      //
+      // The step advance below tests the same projection, so most of the time
+      // the step simply ends here. What this clamp catches is the case the
+      // advance cannot: a step that projects to arrive *before* minDuration has
+      // elapsed. The advance is blocked by minMet, the oven is running hot and
+      // early, and without this it would keep driving into the wait.
+      //
+      // Still a clamp and not a latch: if the climb decays and the projection
+      // falls back below the target, the corridor gets its authority back at
+      // the next control interval and drives again.
+      if (!isDwell && dir > 0.0f && projectedTemp >= step.targetTemp)
+      {
+        powerLevel = 0;
+      }
+
+      // Cooling steps are capped, and by default that cap is zero. See
+      // COOLDOWN_MAX_LEVEL: the descent is a coast, not a controlled one, until
+      // someone decides the door interlock question.
+      //
+      // Also out here because a step entry resets the control clock: entering a
+      // cooling step used to leave the previous step's demand driving the
+      // element for a whole interval, and the transition that matters is peak
+      // to cooldown.
+      if (delta < 0.0f && powerLevel > COOLDOWN_MAX_LEVEL)
+      {
+        powerLevel = COOLDOWN_MAX_LEVEL;
       }
 
       // The level will often alternate between two neighbours rather than
@@ -2094,7 +2143,7 @@ void loop()
         {
           stepStartTemp      = aktSystemTemperature;
           stepStartedTime_ms = time_ms;
-          lastLevelUpdate_ms = time_ms;
+          lastLevelWindow    = relayWindowSeq;
           stepExtending      = false;
           stepGainRef_ms     = time_ms;
           stepGainRefTemp    = aktSystemTemperature;
