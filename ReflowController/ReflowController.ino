@@ -1431,6 +1431,24 @@ void loop()
     static uint64_t coolStepEntered_ms  = 0;
     static uint64_t notClimbingSince_ms = 0;
 
+    // A latched fault must not be able to reach Complete along the success
+    // path. reportError() deliberately does not touch currentState -- it is
+    // also called from relayDriver(), which runs on the esp_timer task, so
+    // writing state from there would be a cross-task write. The consequence
+    // was that a faulted run stayed in Running, marched its remaining steps,
+    // fired the ordinary three-beep door prompt, and finished with the single
+    // beep a good run gives: away from the browser there was nothing to tell
+    // success and failure apart but the RGB LED.
+    //
+    // Ahead of the Running block rather than inside it, so the step machinery
+    // does not get one more pass after the decision to stop has been made.
+    if (globalError && currentState == Running)
+    {
+      powerLevel   = 0;
+      currentState = Complete;
+      beepcount    = 6;   // distinct from the single success beep
+    }
+
     if (currentState == Running)
     {
       if (stateChanged)
