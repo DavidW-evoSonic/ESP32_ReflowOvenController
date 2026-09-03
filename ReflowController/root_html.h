@@ -231,8 +231,11 @@ const char ROOT_HTML[] PROGMEM = R"=====(
 
              if(data.openDoor){
                  $('#door').show();
+                 alarmOn();
              } else {
                  $('#door').hide();
+                 alarmOff();
+                 $('#door_mute').text("Silence").prop('disabled', false);
              }
 
              if(data.fault){
@@ -386,6 +389,72 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             if(confirm("Factory reset? This erases all profiles and the WiFi credentials."))
                 act("factoryreset").done(loadConfig);
         });
+        // The oven's buzzer is optional hardware and the door prompt is the
+        // one time-critical thing this page says, so the browser carries it
+        // too: a tone the laptop makes itself, and the tab title, which is the
+        // only channel that still works when the tab is not on screen.
+        //
+        // Deliberately more insistent than the firmware's three beeps -- it
+        // repeats until the prompt clears or you silence it, because a missed
+        // prompt at peak is a cooked board.
+        var audioCtx  = null;
+        var alarmTimer = null;
+        var alarmMuted = false;
+        var baseTitle  = document.title;
+
+        // Browsers refuse to start audio without a user gesture. Starting a
+        // run from this page is one, but a reload mid-cycle is not -- so take
+        // any click as permission and resume a suspended context.
+        function unlockAudio(){
+            try{
+                if(!audioCtx)
+                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if(audioCtx.state == "suspended") audioCtx.resume();
+            }catch(e){ audioCtx = null; }
+        }
+        $(document).on('click', unlockAudio);
+
+        function beep(freq, ms){
+            if(!audioCtx || audioCtx.state != "running") return;
+            var osc  = audioCtx.createOscillator();
+            var gain = audioCtx.createGain();
+            osc.type = "square";
+            osc.frequency.value = freq;
+            // Ramped, not switched: a hard gate on a square wave clicks.
+            gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + 0.01);
+            gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + ms/1000);
+            osc.connect(gain); gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + ms/1000 + 0.02);
+        }
+
+        function alarmOn(){
+            if(alarmTimer) return;
+            unlockAudio();
+            document.title = "\u26A0 OPEN THE DOOR";
+            var flip = false;
+            alarmTimer = setInterval(function(){
+                flip = !flip;
+                // Two tones, because a warble carries across a room better
+                // than a single pitch does.
+                if(!alarmMuted) beep(flip ? 880 : 1320, 220);
+                document.title = flip ? "\u26A0 OPEN THE DOOR" : baseTitle;
+            }, 700);
+            if(!alarmMuted) beep(880, 220);
+        }
+
+        function alarmOff(){
+            if(alarmTimer){ clearInterval(alarmTimer); alarmTimer = null; }
+            alarmMuted = false;
+            document.title = baseTitle;
+        }
+
+        $('#door_mute').click(function(){
+            alarmMuted = true;
+            $(this).text("silenced").prop('disabled', true);
+        });
+
         // HTTP basic auth, assembled here rather than letting the browser
         // prompt: the password lives in a field on this panel, and a native
         // 401 dialog mid-upload is a worse experience than a refusal.
@@ -491,6 +560,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
          border-top:2px solid #a70; border-bottom:2px solid #a70;
          padding:8px 14px; font-weight:bold; font-size:20px">
       Peak reached &mdash; OPEN THE OVEN DOOR NOW
+      <button id="door_mute" style="margin-left:14px; font-size:15px">Silence</button>
     </div>
     <div id="stage">
     <div id="controls">        
