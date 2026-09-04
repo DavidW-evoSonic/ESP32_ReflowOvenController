@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.6.0"
+#define FW_VERSION "2.7.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -1296,10 +1296,39 @@ void makeDefaultProfile() {
   // residual heat alone at 0% duty and was already declining by the end
   // (241.57 -> 240.73 -> 240.40), so the dwell regulator will now have to
   // supply real power partway through.
+  //
+  // THE SOAK, added 2026-09-04 after the first clean run.
+  //
+  // That run reflowed but the largest components went last, and the board read
+  // cooler than the probe. Neither is a heat shortage: it spent roughly 120 s
+  // above liquidus, well past the 60-90 s spec, and the heavy parts still only
+  // just made it. It is a gradient. A part tied to a ground plane carries far
+  // more mass than the laminate the probe sits on, so it lags, and the profile
+  // gave it nowhere to catch up -- 25 to 170 to 220 to 245 with no plateau
+  // anywhere.
+  //
+  // Time closes a thermal gradient; temperature does not. Raising the peak
+  // further would cook the light parts and still leave the heavy ones behind.
+  // A soak is the standard answer and this profile simply lacked one.
+  //
+  // It has to sit BELOW liquidus or it is not a soak. The obvious change --
+  // lengthening the old 220 step -- would have held the board ABOVE 217 and
+  // made the time-above-liquidus problem worse, so the 220 step becomes 200
+  // and gains a dwell.
+  //
+  // 200 rather than the more usual 150-180: the smaller the gap left to the
+  // liquidus crossing, the less gradient can redevelop on the final ramp, and
+  // 200 is the top of the standard soak band with 17 degC of margin.
+  //
+  // Eight steps is MAX_STEPS exactly. There is no room for another.
   static const Step_t defaultSteps[] = {
     { 170,  72,  94, BOUND_RATE     },  // 0.72-0.94 degC/s
-    { 220,  31,  64, BOUND_DURATION },
-    { 245,  21,  28, BOUND_DURATION },
+    { 200,  40,  70, BOUND_DURATION },  // 0.43-0.75 degC/s into the soak
+    { 200,  60,  90, BOUND_DURATION },  // SOAK: equalise below liquidus
+    { 245,  55,  90, BOUND_DURATION },  // 0.50-0.82 degC/s; the oven manages
+                                        // ~0.88 at 200 and less above, so a
+                                        // shorter window would demand a rate
+                                        // it cannot make
     { 245,  30,  45, BOUND_DURATION },  // dwell at peak; holds for 30 s
     { 220,  21,  28, BOUND_DURATION },
     { 150,  30,  45, BOUND_DURATION },
