@@ -21,11 +21,20 @@ for r in rows:
     except (ValueError, KeyError):
         continue
 
+# The element lags the demand. A sample can read 100% duty while the element
+# is still cold from a cut a moment earlier, which reads as a collapse in
+# capability -- measured 2026-09-04, where a genuine 2.25 degC/s at 210-220
+# was followed by an apparent 0.64 at 230-240 purely because the regulator had
+# started cycling. So require the demand to have been full for a WHILE.
+SETTLE = 3          # consecutive prior samples that must also be full power
+
 buckets = defaultdict(lambda: [0.0, 0.0])      # band -> [degC gained, seconds]
-for (t0, T0, P0), (t1, T1, _) in zip(pts, pts[1:]):
+run = 0
+for i, ((t0, T0, P0), (t1, T1, _)) in enumerate(zip(pts, pts[1:])):
+    run = run + 1 if P0 >= 95.0 else 0
     dt = t1 - t0
     if dt <= 0 or dt > 5:       continue        # gap in the log
-    if P0 < 95.0:               continue        # not full power
+    if run <= SETTLE:           continue        # element not yet up to demand
     if T1 <= T0:                continue        # not climbing
     b = int(T0 // band) * band
     buckets[b][0] += T1 - T0
@@ -38,10 +47,10 @@ if not buckets:
 print("band (degC)      degC/s   seconds at full power")
 for b in sorted(buckets):
     gained, secs = buckets[b]
-    if secs < 2:  continue                      # too little evidence
+    if secs < 4:  continue                      # too little evidence
     print("  %3.0f - %3.0f      %5.3f    %6.1f" % (b, b + band, gained / secs, secs))
 
-hi = [(b, g / s) for b, (g, s) in sorted(buckets.items()) if s >= 2 and b >= 200]
+hi = [(b, g / s) for b, (g, s) in sorted(buckets.items()) if s >= 4 and b >= 200]
 if hi:
     print()
     print("above 200 degC: %.3f degC/s at %d, %.3f at %d"

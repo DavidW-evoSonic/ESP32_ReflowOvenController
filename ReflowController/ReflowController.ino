@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.7.0"
+#define FW_VERSION "2.8.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -1325,10 +1325,26 @@ void makeDefaultProfile() {
     { 170,  72,  94, BOUND_RATE     },  // 0.72-0.94 degC/s
     { 200,  40,  70, BOUND_DURATION },  // 0.43-0.75 degC/s into the soak
     { 200,  60,  90, BOUND_DURATION },  // SOAK: equalise below liquidus
-    { 245,  55,  90, BOUND_DURATION },  // 0.50-0.82 degC/s; the oven manages
-                                        // ~0.88 at 200 and less above, so a
-                                        // shorter window would demand a rate
-                                        // it cannot make
+    { 245,  20,  45, BOUND_DURATION },  // 1.00-2.25 degC/s to peak.
+                                        //
+                                        // Measured 2026-09-04 with the door
+                                        // insulated: 2.2 degC/s sustained at
+                                        // full power through 196-217, against
+                                        // the 0.88 on record before it. The
+                                        // 55-90 s this replaces was derived
+                                        // from that old figure and demanded
+                                        // 0.50-0.82 -- throttling an element
+                                        // that can do four times as much, and
+                                        // holding the board above liquidus
+                                        // while it did.
+                                        //
+                                        // Do NOT read the ~0.6 degC/s that a
+                                        // naive reading of the 230-240 band
+                                        // gives. Power there had been cut and
+                                        // restored, and the element takes
+                                        // ~10 s to answer: the temperature
+                                        // FELL for ten seconds at 100% duty.
+                                        // That is recovery lag, not ceiling.
     { 245,  30,  45, BOUND_DURATION },  // dwell at peak; holds for 30 s
     { 220,  21,  28, BOUND_DURATION },
     { 150,  30,  45, BOUND_DURATION },
