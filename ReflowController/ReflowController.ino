@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.10.0"
+#define FW_VERSION "2.11.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -1355,16 +1355,50 @@ void makeDefaultProfile() {
   // made the time-above-liquidus problem worse, so the 220 step becomes 200
   // and gains a dwell.
   //
-  // 200 rather than the more usual 150-180: the smaller the gap left to the
-  // liquidus crossing, the less gradient can redevelop on the final ramp, and
-  // 200 is the top of the standard soak band with 17 degC of margin.
+  // The soak was 200 and is now 180, measured against the 2026-09-04 pasted
+  // run. 200 was chosen to leave the shortest possible gap to the liquidus
+  // crossing, on the reasoning that less runway means less gradient can
+  // redevelop. It reflowed -- the heavy parts came up together and the paste
+  // stayed liquid visibly longer -- but it cost 141 s above liquidus against a
+  // 60-90 s spec, and the trace shows why.
+  //
+  // A 200 soak is not regulated, it is a coast. Mean duty across the 59 s soak
+  // was 1.7%: the oven arrived on the previous step's stored heat, drifted up
+  // to 208.3 unbidden, and sat there with the element dead. Then step 3 asked
+  // for full power into cold iron and got 0.19 degC/s for the first fifteen
+  // seconds, levelling at ~0.65 -- against the 1.88 the same oven does at the
+  // same temperature when the element is already saturated. Step 3 duly hit
+  // its ceiling at 229.7 and handed a still-climbing board to a "dwell", which
+  // then coasted the last 18 degC over 60 s at zero power. Most of the 141 s
+  // was spent crawling, not soaking.
+  //
+  // 180 gives the ramp 28 degC more runway before 217. The oven crosses
+  // liquidus with the element saturated and real speed in hand, instead of
+  // creeping over it. That mechanism holds regardless of anything else.
+  //
+  // The weaker claim, and it is worth marking as unverified: 180 should also
+  // force the controller to actually regulate rather than coast, keeping duty
+  // -- and therefore the element -- alive through the soak. That is plausible
+  // but not measured, and the drift to 208 was stored heat rather than a
+  // steady state, so a lower target may simply settle lower and still on ~0%
+  // duty. MEASURE THE MEAN SOAK DUTY on the next run. If it is still near
+  // zero, this half did not work and the element-drain problem needs a
+  // different lever.
+  //
+  // Step 3 keeps its 20-45 s despite now climbing 65 degC rather than 45.
+  // Widening it would be worse: step 3 currently times out and hands over
+  // mid-climb, so the peak dwell is consumed by the ramp. Sized "correctly"
+  // it would arrive at 245 and then dwell a further 30-45 s there, adding
+  // ~30 s of time above liquidus. The sloppy version is the cheap one.
   //
   // Eight steps is MAX_STEPS exactly. There is no room for another.
   static const Step_t defaultSteps[] = {
     { 170,  72,  94, BOUND_RATE     },  // 0.72-0.94 degC/s
-    { 200,  40,  70, BOUND_DURATION },  // 0.43-0.75 degC/s into the soak
-    { 200,  60,  90, BOUND_DURATION },  // SOAK: equalise below liquidus
-    { 245,  20,  45, BOUND_DURATION },  // 1.00-2.25 degC/s to peak.
+    { 180,  15,  30, BOUND_DURATION },  // 0.33-0.67 degC/s into the soak
+    { 180,  60,  90, BOUND_DURATION },  // SOAK: equalise below liquidus
+    { 245,  20,  45, BOUND_DURATION },  // 1.44-3.25 degC/s to peak; see the
+                                        // note above on why this is NOT
+                                        // widened to match the longer climb.
                                         //
                                         // Measured 2026-09-04 with the door
                                         // insulated: 2.2 degC/s sustained at
