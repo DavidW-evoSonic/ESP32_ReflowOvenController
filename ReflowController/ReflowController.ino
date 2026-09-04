@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.3.0"
+#define FW_VERSION "2.4.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -855,6 +855,10 @@ WebServer serverAction(8080);
 // reason is kept so /status can report it instead of the oven just going quiet.
 volatile boolean globalError=false;
 const char * globalErrorText = "";
+// Non-fatal counterpart. Deliberately separate from globalError: nothing gates
+// a start or stops a run on this.
+volatile boolean globalWarning = false;
+const char * globalWarningText = "";
 
 // Heater demand, 0..255, consumed by relayDriver().
 volatile uint8_t  powerHeater=0;
@@ -1030,6 +1034,30 @@ float Hue_2_RGB( float v1, float v2, float vH )
 // the web server down with it, leaving no way to find out what went wrong, so
 // this returns and lets loop() keep serving /status. The RGB LED flashes red
 // for anyone standing at the oven.
+// A condition the operator should know about that does NOT justify ending the
+// run.
+//
+// The distinction is whether stopping helps. A dead thermocouple or a welded
+// contact must stop the oven: continuing is either blind or damaging. A step
+// that heated too slowly is neither. Nobody can replace a heater with a board
+// in the chamber, so aborting there converts "this might still be a good
+// board" into "this is definitely a ruined board" -- and that is exactly what
+// happened on 2026-09-04, when step 0 came up 3 degC short of 170 and the run
+// stopped with the paste half soaked and no way to restart.
+//
+// So these latch, surface in /status and the UI, and the profile carries on.
+// The run finishes and the operator decides what the board is worth.
+void reportWarning(const char *text)
+{
+  if (globalWarning) return;  // first cause, same as reportError
+
+  globalWarning = true;
+  globalWarningText = text;
+
+  Serial.print("Warning: ");
+  Serial.println(text);
+}
+
 void reportError(const char *text)
 {
   if (globalError) return; // keep the first cause, not the last
@@ -1585,20 +1613,20 @@ void setup() {
   });
   server.on("/status", []() {
     server.sendHeader("Cache-Control","no-cache");
-    char buffer[512];
+    char buffer[640];   // grew for "warning"
     unsigned long time = (esp_timer_get_time()-cycleStartTime)/1000;
     snprintf(buffer,sizeof(buffer),
       "{\"time\": %lu, \"temp\": %.2f, \"dt\": %.2f, \"setpoint\": %.2f,"
       " \"low\": %.2f, \"high\": %.2f, \"power\": %.2f, \"step\": %d,"
       " \"steps\": %d, \"lag\": %.1f, \"openDoor\": %d, \"heating\": %d,"
       " \"extending\": %d, \"extended\": %.0f, \"mcu\": %.1f,"
-      " \"state\": \"%s\", \"fault\": \"%s\"}",
+      " \"state\": \"%s\", \"fault\": \"%s\", \"warning\": \"%s\"}",
       time, aktSystemTemperature, aktSystemTemperatureRamp, heaterSetpoint,
       corridorLow, corridorHigh,
       (float)powerHeater*100.0f/255.0f, activeStep, activeProfile.stepCount,
       thermalLagSec, openDoorPrompt ? 1 : 0, heaterOn ? 1 : 0,
       stepExtending ? 1 : 0, runExtendUsed_s, mcuTemp_C,
-      currentStateToString(), globalErrorText);
+      currentStateToString(), globalErrorText, globalWarningText);
     server.send(200, "application/json", buffer);
   });
   // Slot directory for the profile picker: every slot, named or free.
@@ -2353,6 +2381,11 @@ void loop()
     {
       if (stateChanged)
       {
+        // Warnings are per-run. Unlike globalError they are not a lockout, so
+        // clearing them here costs nothing and stops a previous run's message
+        // being read as this one's.
+        globalWarning     = false;
+        globalWarningText = "";
         activeStep         = 0;
         stepStartTemp      = aktSystemTemperature;
         stepStartedTime_ms = time_ms;
@@ -2668,7 +2701,7 @@ void loop()
             runExtendUsed_s >= RUN_EXTEND_BUDGET_S ||
             runExtendLiq_s  >= RUN_EXTEND_LIQ_S)
         {
-          reportError("Extended step never reached target");
+          reportWarning("Extended step never reached target");
           stepExtending = false;  // fall through to the ordinary advance
         }
         else if (!gaining)
@@ -2681,7 +2714,7 @@ void loop()
           stepExtending = false;
           if (miss_C > DWELL_BAND_C)
           {
-            reportError("Extended step stalled short of target");
+            reportWarning("Extended step stalled short of target");
           }
         }
       }
@@ -2711,7 +2744,7 @@ void loop()
         if (timedOut && !reached && dir > 0.0f &&
             (step.targetTemp - aktSystemTemperature) > STEP_MISS_C)
         {
-          reportError(gaining
+          reportWarning(gaining
             ? "Out of extension budget, still short of target"
             : "Oven not heating: step timed out short of target");
         }
@@ -2882,7 +2915,7 @@ void loop()
         {
           if (aktSystemTemperature - heatStallRefTemp < HEAT_STALL_MIN_RISE_C)
           {
-            reportError("Oven not heating: no rise under power");
+            reportWarning("Oven not heating: no rise under power");
           }
           // Roll the window either way, so a recovered oven is not judged on
           // history and a still-dead one re-reports on the next window.

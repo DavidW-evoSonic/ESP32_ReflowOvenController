@@ -289,6 +289,15 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                  // the conditions that raise one.
                  $('#fault').text("FAULT: "+data.fault).show();
              }
+             // Amber, and deliberately NOT the red fault banner: the run is
+             // still going. A warning says the oven fell behind, not that it
+             // stopped, and the two must not look alike at a glance.
+             if(data.warning){
+                 $('#warn').text("Warning: "+data.warning
+                                 +" \u2014 the run is continuing").show();
+             } else {
+                 $('#warn').hide();
+             }
 
              // draw() rebuilds the whole SVG, so it is now called only when
              // the picture has actually changed. It used to run on every poll
@@ -300,13 +309,16 @@ const char ROOT_HTML[] PROGMEM = R"=====(
 
              if(data.state=="Ready")
              {
-                 // Only on the way in. Rebuilding the DataTable every poll was
-                 // what forced a redraw a second while idle.
-                 if(stateChanged){
-                     initchartdata();
-                     classicOptions.hAxis.viewWindow.max=100;
-                     needDraw=true;
-                 }
+                 // Returning to Ready does NOT clear the chart. It used to,
+                 // and that threw away the trace at the worst moment: the
+                 // firmware keeps no run history, so between Complete and the
+                 // Download Graph button this tab holds the only copy. On
+                 // 2026-09-04 a faulted run went Complete -> Ready on a /stop
+                 // and took its own evidence with it.
+                 //
+                 // Cleared when the next run STARTS instead, below, which is
+                 // the moment the old trace actually stops being wanted.
+                 if(stateChanged) needDraw=true;
                  running=false;
                  $('#action').text(
                      (startMax!==null && data.temp > startMax)
@@ -320,6 +332,14 @@ const char ROOT_HTML[] PROGMEM = R"=====(
 
              if(stateChanged)
              {
+                // A new cycle beginning is what retires the previous trace.
+                // Anything that produces a curve counts; arriving at Ready or
+                // Complete does not, those being where a trace is read.
+                if(data.state!="Ready" && data.state!="Complete"
+                   && (lastState=="Ready" || lastState=="Complete")){
+                    initchartdata();          // also resets coastRows
+                    classicOptions.hAxis.viewWindow.max=100;
+                }
                 lastState = data.state;
                 lable     = data.state;
                 needDraw  = true;
@@ -660,6 +680,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         <button id="toggle">Settings</button> <br>
         <a id="export" href="#">Download Graph</a>
         <div id="fault" style="display:none; color:#fff; background:#c00; padding:4px; margin-top:4px; font-weight:bold"></div>
+        <div id="warn" style="display:none; color:#000; background:#fd7; border:1px solid #a70; padding:4px; margin-top:4px"></div>
 
         <div id="panel" style="display:none; margin-top:8px; font-size:12px">
           <fieldset><legend>Profile slot</legend>
