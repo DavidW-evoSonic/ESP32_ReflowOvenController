@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.3.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -171,6 +171,44 @@ static_assert(!(HEATER >= 34 && HEATER <= 39),
 // run, so
 // the symptom is a dead oven, not a damaged one.
 #define AD595_MV_PER_C        10.0f
+
+// Sensor calibration: true = c2*raw^2 + c1*raw + c0, raw being the
+// uncorrected mv*ratio/10 reading.
+//
+// Measured 2026-09-04 against a K-type handheld, both probes in free air 5 mm
+// apart, six points from 25 to 226 degC. Full data and method in
+// logs/2026-09-04_probe_calibration.csv.
+//
+// It is a QUADRATIC because the response is not straight, and that only shows
+// at the top. A line through the five points below 145 degC fitted them to
+// +-0.03 degC and predicted the 226 degC point 3.6 degC wrong. Suspect the
+// AD595: it linearises the K-type curve at a fixed 10 mV/degC which is exact
+// only near its design point, while the meter uses a proper polynomial.
+//
+// These are properties of the SENSOR CHAIN -- thermocouple, AD595, divider,
+// ADC -- and not of the oven. A different oven does not invalidate them; a
+// different probe, amplifier or controller board does. They are settable at
+// runtime for that reason.
+//
+// Identity (0, 1, 0) disables the correction and returns the raw reading.
+#define TEMP_CAL_C2_DEFAULT    1.88645804e-4f
+#define TEMP_CAL_C1_DEFAULT    0.926919005f
+#define TEMP_CAL_C0_DEFAULT   -0.633558936f
+
+// A calibration that reads LOW makes the oven run HOT, silently, which is the
+// dangerous direction and the reason these are validated rather than trusted.
+// Checked across the whole plausible span: strictly increasing, and never
+// further than this from the raw reading.
+//
+// 30 degC is deliberately tight. The measured correction on this hardware
+// peaks at 7.7 degC, so this still allows four times that for a different
+// sensor chain -- but a thermometer needing more than 30 degC of correction is
+// broken rather than uncalibrated. At 60 a flipped sign on c2 passed: it stays
+// monotonic and peaks at 49 degC of deviation, while running the oven 21.7
+// degC hot at reflow temperature. That is precisely the failure this is here
+// to catch, so the window is sized to catch it.
+#define TEMP_CAL_CHECK_MAX_C   350
+#define TEMP_CAL_MAX_DELTA_C   30.0f
 #define TEMP_DIVIDER_RATIO     1.5f
 #define TEMP_OVERSAMPLE         64
 
@@ -894,6 +932,24 @@ uint64_t holdSetAt_ms = 0;     // when this hold (or its latest setpoint) began
 float    holdTrim    = 0.0f;   // integral term, in power levels
 float    holdPBandC  = HOLD_PBAND_DEFAULT_C;  // runtime-tunable, see /oven
 float    holdTrimStep = HOLD_TRIM_DEFAULT;
+float    calC2 = TEMP_CAL_C2_DEFAULT;   // sensor calibration, see /oven
+float    calC1 = TEMP_CAL_C1_DEFAULT;
+float    calC0 = TEMP_CAL_C0_DEFAULT;
+
+// Rejects a calibration that is not usable as a thermometer: it must rise
+// everywhere a reading can land, and must not move the reading absurdly far.
+static bool calSane(float c2, float c1, float c0)
+{
+  float prev = c2*0.0f*0.0f + c1*0.0f + c0;
+  for (int r = 1; r <= TEMP_CAL_CHECK_MAX_C; r++)
+  {
+    float v = c2*(float)r*(float)r + c1*(float)r + c0;
+    if (v <= prev) return false;                                  // must rise
+    if (fabsf(v - (float)r) > TEMP_CAL_MAX_DELTA_C) return false; // sanity
+    prev = v;
+  }
+  return true;
+}
 // Result of the last measurement, 0 if none this power-up.
 float measuredLagSec = 0.0f;
 // Set when the oven has peaked and wants its door opened. The buzzer says so
@@ -1062,7 +1118,16 @@ float readTemperature() {
   uint32_t mvHi  = esp_adc_cal_raw_to_voltage(whole + 1, &adcChars);
   float    mv    = mvLo + (float)(mvHi - mvLo) * frac / TEMP_OVERSAMPLE;
 
-  return (mv * TEMP_DIVIDER_RATIO) / AD595_MV_PER_C;
+  float raw = (mv * TEMP_DIVIDER_RATIO) / AD595_MV_PER_C;
+
+  // Sensor calibration. Applied here so every consumer -- the control loop,
+  // the faults, /status, the chart -- sees one temperature and there is no
+  // second place where a raw reading could leak through.
+  //
+  // Note this shifts TEMP_PLAUSIBLE_MAX_C slightly in raw terms: the 300 degC
+  // fault now trips at about 306 raw, because the correction subtracts ~6
+  // there. That is well inside the margin the threshold was chosen with.
+  return calC2 * raw * raw + calC1 * raw + calC0;
 }
 
 // Drives the mechanical relay with slow time-proportional control.
@@ -1329,10 +1394,12 @@ typedef struct {
   // gains in this controller -- the corridor law still has none.
   float   holdPBandC;
   float   holdTrimStep;
+  float   calC2, calC1, calC0;
 } Oven_t;
 
 bool saveOven() {
-  Oven_t o = { thermalLagSec, measureTempC, holdPBandC, holdTrimStep };
+  Oven_t o = { thermalLagSec, measureTempC, holdPBandC, holdTrimStep,
+               calC2, calC1, calC0 };
   PREF.putBytes("OVEN", (uint8_t*)&o, sizeof(o));
   return true;
 }
@@ -1345,6 +1412,7 @@ bool loadOven() {
     measureTempC  = MEASURE_TEMP_DEFAULT_C;
     holdPBandC    = HOLD_PBAND_DEFAULT_C;
     holdTrimStep  = HOLD_TRIM_DEFAULT;
+    calC2 = TEMP_CAL_C2_DEFAULT; calC1 = TEMP_CAL_C1_DEFAULT; calC0 = TEMP_CAL_C0_DEFAULT;
     return true;
   }
   PREF.getBytes("OVEN", (uint8_t*)&o, sizeof(o));
@@ -1364,6 +1432,15 @@ bool loadOven() {
   holdTrimStep  = (o.holdTrimStep >= HOLD_TRIM_MIN &&
                    o.holdTrimStep <= HOLD_TRIM_MAX)
                   ? o.holdTrimStep : HOLD_TRIM_DEFAULT;
+  // Same validation the setter uses. This came off flash and feeds every
+  // temperature in the system, so it is not taken on trust either.
+  if (calSane(o.calC2, o.calC1, o.calC0))
+  { calC2 = o.calC2; calC1 = o.calC1; calC0 = o.calC0; }
+  else
+  {
+    Serial.println("stored calibration rejected -- using default");
+    calC2 = TEMP_CAL_C2_DEFAULT; calC1 = TEMP_CAL_C1_DEFAULT; calC0 = TEMP_CAL_C0_DEFAULT;
+  }
   return true;
 }
 
@@ -1386,6 +1463,7 @@ void factoryReset() {
   measureTempC  = MEASURE_TEMP_DEFAULT_C;
   holdPBandC    = HOLD_PBAND_DEFAULT_C;
   holdTrimStep  = HOLD_TRIM_DEFAULT;
+  calC2 = TEMP_CAL_C2_DEFAULT; calC1 = TEMP_CAL_C1_DEFAULT; calC0 = TEMP_CAL_C0_DEFAULT;
   measuredLagSec = 0.0f;
 }
 
@@ -1643,6 +1721,9 @@ void setup() {
            ", \"startMaxTemp\": " + String(PROFILE_START_MAX_C) +
            ", \"holdPBand\": " + String(holdPBandC, 1) +
            ", \"holdTrim\": " + String(holdTrimStep, 2) +
+           ", \"calC2\": " + String(calC2, 9) +
+           ", \"calC1\": " + String(calC1, 6) +
+           ", \"calC0\": " + String(calC0, 4) +
            "}, \"otaSet\": " + String(otaPassword.length() ? 1 : 0) +
            ", \"version\": \"" FW_VERSION "\"" +
            ", \"build\": \"" FW_BUILD "\"}";
@@ -1810,6 +1891,28 @@ void setup() {
       if (v < HOLD_TRIM_MIN) v = HOLD_TRIM_MIN;
       if (v > HOLD_TRIM_MAX) v = HOLD_TRIM_MAX;
       holdTrimStep = v;
+    }
+    // Sensor calibration. All three together and all-or-nothing: the
+    // coefficients only mean anything as a set, and half-applying them would
+    // leave a curve nobody chose. Unspecified terms keep their current value,
+    // so one can be nudged without restating the others.
+    if(serverAction.hasArg("calC2") || serverAction.hasArg("calC1") ||
+       serverAction.hasArg("calC0"))
+    {
+      float n2 = serverAction.hasArg("calC2") ? serverAction.arg("calC2").toFloat() : calC2;
+      float n1 = serverAction.hasArg("calC1") ? serverAction.arg("calC1").toFloat() : calC1;
+      float n0 = serverAction.hasArg("calC0") ? serverAction.arg("calC0").toFloat() : calC0;
+      if (!calSane(n2, n1, n0))
+      {
+        // Refused rather than clamped. There is no safe way to nudge a bad
+        // calibration into a good one, and a silently clamped curve reading
+        // low would run the oven hot without saying so.
+        serverAction.send(409, "text/plain",
+          "Calibration rejected: must rise across 0-350C and stay within 30C "
+          "of the raw reading");
+        return;
+      }
+      calC2 = n2; calC1 = n1; calC0 = n0;
     }
     saveOven();
     serverAction.send(200, "text/plain", "OK");

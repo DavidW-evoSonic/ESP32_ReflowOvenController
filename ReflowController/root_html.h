@@ -403,6 +403,9 @@ const char ROOT_HTML[] PROGMEM = R"=====(
                 $('#p_limit').text(c.maxSteps);
                 $('#o_thermalLag').val(c.oven.thermalLag);
                 $('#o_measureTemp').val(c.oven.measureTemp);
+                $('#o_calC2').val(c.oven.calC2);
+                $('#o_calC1').val(c.oven.calC1);
+                $('#o_calC0').val(c.oven.calC0);
                 startMax = c.oven.startMaxTemp;
                 // Build identity, next to the upload control on purpose:
                 // this is what you compare against before an OTA push, and
@@ -457,6 +460,11 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         });
         $('#manual_set').click(function(){
             act("manual", {power: $('#manual_power').val()});
+        });
+        $('#cal_apply').click(function(){
+            act("oven", {calC2: $('#o_calC2').val(),
+                         calC1: $('#o_calC1').val(),
+                         calC0: $('#o_calC0').val()}).done(loadConfig);
         });
         $('#hold_set').click(function(){
             act("hold", {temp: $('#hold_temp').val()});
@@ -680,6 +688,17 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             <button id="o_apply">Apply</button>
             <button id="o_measure">Measure</button><br>
             <span id="o_measured"></span><br>
+            <label>Probe calibration &mdash; true = c2&middot;raw&sup2; + c1&middot;raw + c0<br>
+              <input id="o_calC2" size="14"> <input id="o_calC1" size="12">
+              <input id="o_calC0" size="10">
+              <button id="cal_apply">Apply</button></label><br>
+            <span>A property of the thermocouple, AD595 and ADC &mdash; not of
+              the oven, so a different chamber does not invalidate it but a
+              different probe or controller board does. Enter
+              <code>0 1 0</code> for no correction. Refused unless the curve
+              rises across 0-350&deg;C and stays within 30&deg;C of the raw
+              reading: a calibration that reads low runs the oven hot without
+              telling you.</span><br>
             <span>How far the oven keeps climbing after the relay opens. Measure
               it loaded with a representative board &mdash; an empty oven is a
               different oven.</span>
