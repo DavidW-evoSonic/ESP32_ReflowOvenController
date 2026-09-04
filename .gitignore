@@ -38,3 +38,10 @@ eagle.epf
 
 # PlatformIO
 .pio/
+
+# Oven-specific and personal: run captures, measured behaviour, handover notes.
+# Kept on disk, deliberately never tracked -- purged from history 2026-09-04.
+logs/
+REWORK_NOTES.md
+HARDWARE_CHECKS.md
+PORTING_ANALYSIS.md
