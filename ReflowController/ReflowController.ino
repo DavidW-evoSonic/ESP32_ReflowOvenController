@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.1.0"
+#define FW_VERSION "2.2.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -476,7 +476,9 @@ static_assert(ONTIME_FOR_LEVEL(POWER_LEVELS - 2)
 // projection says "arriving", power is already near zero, which is what the
 // projection assumed all along. Full demand at HOLD_PBAND_C below target,
 // falling linearly to nothing at the target.
-#define HOLD_PBAND_C      25.0f
+#define HOLD_PBAND_DEFAULT_C  25.0f
+#define HOLD_PBAND_MIN_C       5.0f
+#define HOLD_PBAND_MAX_C     100.0f
 
 // P alone parks below setpoint -- holding a temperature needs real power, and
 // a proportional term commands none at zero error. This trims that out.
@@ -487,7 +489,12 @@ static_assert(ONTIME_FOR_LEVEL(POWER_LEVELS - 2)
 // 8 s control interval reaches the 2-3 levels an equilibrium needs in about a
 // minute and a half, which is slow against the oven and cannot itself drive
 // an overshoot.
-#define HOLD_TRIM_STEP     0.25f
+// Trim of exactly 0 is allowed, and is the useful diagnostic: it runs the
+// regulator proportional-only, which parks below setpoint by however much
+// power the equilibrium needs. That droop IS the measurement of it.
+#define HOLD_TRIM_DEFAULT      0.25f
+#define HOLD_TRIM_MIN          0.0f
+#define HOLD_TRIM_MAX          2.0f
 
 // A heating step that times out on its slow bound this far short of target has
 // not merely run slow -- the element is not heating. The PID build had no such
@@ -885,6 +892,8 @@ int16_t measureTempC = MEASURE_TEMP_DEFAULT_C;
 int16_t  holdTempC   = 0;      // Hold setpoint, degC
 uint64_t holdSetAt_ms = 0;     // when this hold (or its latest setpoint) began
 float    holdTrim    = 0.0f;   // integral term, in power levels
+float    holdPBandC  = HOLD_PBAND_DEFAULT_C;  // runtime-tunable, see /oven
+float    holdTrimStep = HOLD_TRIM_DEFAULT;
 // Result of the last measurement, 0 if none this power-up.
 float measuredLagSec = 0.0f;
 // Set when the oven has peaked and wants its door opened. The buzzer says so
@@ -1315,10 +1324,15 @@ void loadProfileName(uint8_t id, char * buffer){
 typedef struct {
   float   thermalLagSec;
   int16_t measureTempC;
+  // Hold-regulator gains. Runtime-settable because tuning them by rebuilding
+  // and reflashing costs a firmware cycle per iteration, and they are the only
+  // gains in this controller -- the corridor law still has none.
+  float   holdPBandC;
+  float   holdTrimStep;
 } Oven_t;
 
 bool saveOven() {
-  Oven_t o = { thermalLagSec, measureTempC };
+  Oven_t o = { thermalLagSec, measureTempC, holdPBandC, holdTrimStep };
   PREF.putBytes("OVEN", (uint8_t*)&o, sizeof(o));
   return true;
 }
@@ -1329,6 +1343,8 @@ bool loadOven() {
     Serial.println("load default OVEN");
     thermalLagSec = THERMAL_LAG_DEFAULT_S;
     measureTempC  = MEASURE_TEMP_DEFAULT_C;
+    holdPBandC    = HOLD_PBAND_DEFAULT_C;
+    holdTrimStep  = HOLD_TRIM_DEFAULT;
     return true;
   }
   PREF.getBytes("OVEN", (uint8_t*)&o, sizeof(o));
@@ -1342,6 +1358,12 @@ bool loadOven() {
   measureTempC  = (o.measureTempC >= MEASURE_TEMP_MIN_C &&
                    o.measureTempC <= MEASURE_TEMP_MAX_C)
                   ? o.measureTempC : MEASURE_TEMP_DEFAULT_C;
+  holdPBandC    = (o.holdPBandC >= HOLD_PBAND_MIN_C &&
+                   o.holdPBandC <= HOLD_PBAND_MAX_C)
+                  ? o.holdPBandC : HOLD_PBAND_DEFAULT_C;
+  holdTrimStep  = (o.holdTrimStep >= HOLD_TRIM_MIN &&
+                   o.holdTrimStep <= HOLD_TRIM_MAX)
+                  ? o.holdTrimStep : HOLD_TRIM_DEFAULT;
   return true;
 }
 
@@ -1362,6 +1384,8 @@ void factoryReset() {
   makeDefaultProfile();
   thermalLagSec = THERMAL_LAG_DEFAULT_S;
   measureTempC  = MEASURE_TEMP_DEFAULT_C;
+  holdPBandC    = HOLD_PBAND_DEFAULT_C;
+  holdTrimStep  = HOLD_TRIM_DEFAULT;
   measuredLagSec = 0.0f;
 }
 
@@ -1617,6 +1641,8 @@ void setup() {
            ", \"measureTemp\": " + String(measureTempC) +
            ", \"measuredLag\": " + String(measuredLagSec, 1) +
            ", \"startMaxTemp\": " + String(PROFILE_START_MAX_C) +
+           ", \"holdPBand\": " + String(holdPBandC, 1) +
+           ", \"holdTrim\": " + String(holdTrimStep, 2) +
            "}, \"otaSet\": " + String(otaPassword.length() ? 1 : 0) +
            ", \"version\": \"" FW_VERSION "\"" +
            ", \"build\": \"" FW_BUILD "\"}";
@@ -1770,6 +1796,20 @@ void setup() {
       if (v < MEASURE_TEMP_MIN_C) v = MEASURE_TEMP_MIN_C;
       if (v > MEASURE_TEMP_MAX_C) v = MEASURE_TEMP_MAX_C;
       measureTempC = (int16_t)v;
+    }
+    if(serverAction.hasArg("holdPBand"))
+    {
+      float v = serverAction.arg("holdPBand").toFloat();
+      if (v < HOLD_PBAND_MIN_C) v = HOLD_PBAND_MIN_C;
+      if (v > HOLD_PBAND_MAX_C) v = HOLD_PBAND_MAX_C;
+      holdPBandC = v;
+    }
+    if(serverAction.hasArg("holdTrim"))
+    {
+      float v = serverAction.arg("holdTrim").toFloat();
+      if (v < HOLD_TRIM_MIN) v = HOLD_TRIM_MIN;
+      if (v > HOLD_TRIM_MAX) v = HOLD_TRIM_MAX;
+      holdTrimStep = v;
     }
     saveOven();
     serverAction.send(200, "text/plain", "OK");
@@ -2891,16 +2931,16 @@ void loop()
         float err = (float)holdTempC - projectedTemp;
 
         // Proportional. Computed, never accumulated -- see HOLD_PBAND_C.
-        float p = (err / HOLD_PBAND_C) * TOP;
+        float p = (err / holdPBandC) * TOP;
         if (p < 0.0f) p = 0.0f;
         if (p > TOP)  p = TOP;
 
         // Integral trim, gated to the band and to outside the deadband so it
         // does not hunt once the oven is where it was asked to be.
         float mag = fabsf(err);
-        if (mag < HOLD_PBAND_C && mag > DWELL_BAND_C)
+        if (mag < holdPBandC && mag > DWELL_BAND_C)
         {
-          holdTrim += (err > 0.0f) ? HOLD_TRIM_STEP : -HOLD_TRIM_STEP;
+          holdTrim += (err > 0.0f) ? holdTrimStep : -holdTrimStep;
           if (holdTrim < 0.0f) holdTrim = 0.0f;
           if (holdTrim > TOP)  holdTrim = TOP;
         }
