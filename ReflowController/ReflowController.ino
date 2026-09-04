@@ -2699,8 +2699,6 @@ void loop()
       }
       bool gaining = stepGaining;
 
-      float miss_C = (float)step.targetTemp - aktSystemTemperature;
-
       // A HEATING STEP HAS NO TIME LIMIT. It ends when it reaches its target,
       // or when the oven proves it cannot.
       //
