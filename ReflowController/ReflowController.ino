@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.4.0"
+#define FW_VERSION "2.5.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -593,64 +593,14 @@ static_assert(ONTIME_FOR_LEVEL(POWER_LEVELS - 2)
 // gate was guarding a case that was already covered twice.
 //
 // What bounds an extension is therefore time, not distance:
-// STEP_EXTEND_CAP_S per step, RUN_EXTEND_BUDGET_S per run, and
-// RUN_EXTEND_LIQ_S of that above liquidus.
-
-// Absolute per-step cap, seconds.
+// A heating step ends on its target, not on a clock. There is no extension
+// budget: see the block at `stepExtending` in the control loop for why a
+// budget was the wrong question, and what replaced it.
 //
-// Deliberately not a multiple of maxDuration: that unit is largest exactly
-// where extension matters least (361 s on the default step 0, against 28 s on
-// the peak) and is bounded by nothing chemical. Derived instead from the work
-// to be done -- closing a STEP_EXTEND_ENTRY_C gap at the rate floor below
-// takes 37-42 s on every heating step of the default profile.
-#define STEP_EXTEND_CAP_S       45.0f
-
-// Run-wide extension budget, seconds. Per-step caps compose with the step
-// count, and MAX_STEPS is 8, so a per-step cap on its own bounds nothing
-// useful. A step that ends short also rebases the next step's start on the
-// measured temperature, shrinking its delta while its durations stay fixed --
-// so an extension makes the following step harder, and more likely to extend
-// in turn. This is what stops that cascading.
-#define RUN_EXTEND_BUDGET_S     60.0f
-
-// Run-wide budget for extension time spent above liquidus, seconds.
-//
-// This, not the per-step cap, is the constraint that actually limits the
-// feature. Time above liquidus is what grows intermetallics and damages parts,
-// and the default profile is expected near 65 s above 217 degC before any
-// extension -- see the note at defaultSteps, and note that figure is measured
-// rather than summed from declared durations, which overpredicted it by 13 s.
-// Against a 60-90 s paste spec that leaves about 25 s of headroom, so the
-// budget is 12 s: a fully extended run lands near 78 s, inside spec with room
-// for the estimate to be wrong again.
-//
-// It was 25 s, which was correct for the profile that existed then -- a
-// triangular 243 degC apex spending 61.8 s above liquidus. Adding the peak
-// dwell spent most of that headroom, and the dwell is the better use of it:
-// it is time at temperature by design rather than time granted to a step that
-// is struggling. Uncapped, extensions on the steps above 217 would reach
-// 154 s.
+// LIQUIDUS_C is still used -- the profile is sized around time above it, and
+// the peak dwell is what delivers that time.
 #define LIQUIDUS_C              217.0f
-#define RUN_EXTEND_LIQ_S        12.0f
 
-// "Still gaining" -- measured as a temperature DIFFERENCE ACROSS A WINDOW, and
-// never as an instantaneous rate.
-//
-// aktSystemTemperatureRamp is a 1 s difference of a 1 s rolling mean, so it
-// carries roughly sqrt(2)/sqrt(10) of the per-read noise: about 0.045 degC/s
-// of sigma on this hardware (REWORK_NOTES 7.1). Thresholding that directly is
-// a coin flip evaluated at 10 Hz, and across a 45 s extension noise alone
-// would hold the test open indefinitely.
-//
-// Differencing the temperature across a whole window telescopes instead: an
-// ADC excursion that inflates one endpoint inflates the next window's start by
-// the same amount, so a spike can shift one boundary but cannot manufacture
-// sustained gain. Only a steady bias of this size could, and a bias that large
-// would walk the absolute reading into TEMP_PLAUSIBLE_MAX_C on its own.
-//
-// Do NOT reuse MEASURE_MIN_RATE_C_S (0.05) here. That is about one sigma of
-// this noise, and it answers a different question at a different operating
-// point.
 #define STEP_EXTEND_GAIN_WINDOW_MS 20000
 
 // An absolute floor, and only an absolute floor.
@@ -669,11 +619,21 @@ static_assert(ONTIME_FOR_LEVEL(POWER_LEVELS - 2)
 // so 0.025 degC/s of sigma -- the floor sits at roughly 8 sigma, while still
 // being an order of magnitude below any rate the profile asks for.
 //
-// Note this test is a weak limiter by nature: at full power the oven really is
-// gaining right up to thermal equilibrium, with the rate decaying through 0.4,
-// 0.2, 0.1 degC/s. The caps above do most of the safety work, so do not size
-// them on the assumption that gaining will end most extensions early.
-#define STEP_EXTEND_MIN_RATE_C_S   0.20f
+// THIS IS NOW THE ONLY THING THAT ENDS A HEATING STEP SHORT. It used to be a
+// weak limiter backed by the extension caps, and its own note said not to size
+// it as the primary test. The caps are gone, so it has been resized for the
+// job it actually has.
+//
+// 0.20 was too impatient once it stood alone: a step 3 degC short and climbing
+// 0.15 degC/s would be abandoned despite arriving twenty seconds later. 0.10
+// roughly doubles the patience and still sits about 4 sigma clear of the
+// noise -- endpoint noise over a 20 s window is ~0.5 degC, so ~0.025 degC/s.
+//
+// It cannot go much lower. At full power the oven keeps gaining right up to
+// thermal equilibrium, the rate decaying through 0.4, 0.2, 0.1, and a floor
+// buried in the noise would wait out an asymptote it can never reach. 0.10 is
+// the point where "still climbing" stops meaning "will arrive".
+#define STEP_EXTEND_MIN_RATE_C_S   0.10f
 
 // A profile may not start from a warm chamber.
 //
@@ -977,7 +937,6 @@ bool stepExtending = false;
 // departure from the profile the step declared and must never be silent even
 // when nothing latches a fault.
 float runExtendUsed_s = 0.0f;   // total extension time this run
-float runExtendLiq_s  = 0.0f;   // ... of which was spent above liquidus
 // The controller's own die temperature, degC.
 //
 // The electronics sit in an enclosure inside the oven, one sheet of metal from
@@ -1313,8 +1272,11 @@ void makeDefaultProfile() {
   // So the only honest method is measurement, and the only DETERMINISTIC
   // contribution is the dwell -- everything else depends on a trajectory. From
   // the run: 32.3 s of measured non-dwell time, plus the 3.3 s the 220 step now
-  // earns, is a 35.6 s base. The 30 s dwell puts the total near 65 s, mid-spec,
-  // and RUN_EXTEND_LIQ_S 12 keeps a fully extended run near 78 s.
+  // earns, is a 35.6 s base. The 30 s dwell puts the total near 65 s, mid-spec.
+  //
+  // Nothing caps it any more. The extension budget that used to hold a fully
+  // extended run near 78 s is gone, so a slow oven inching toward its targets
+  // can spend considerably longer than that above liquidus.
   //
   // The dwell contributes exactly its minDuration, not a range: `reached` is
   // unconditionally true for a dwell step (delta is zero, so isDwell), and the
@@ -2356,7 +2318,6 @@ void loop()
     static float    heatStallRefTemp    = 0.0f;
     static uint64_t stepGainRef_ms      = 0;
     static float    stepGainRefTemp     = 0.0f;
-    static float    stepExtendStart_s   = 0.0f;  // elapsed_s when it began
     static bool     stepGaining         = true;  // verdict, one per window
 
     // A latched fault must not be able to reach Complete along the success
@@ -2407,7 +2368,6 @@ void loop()
         stepGaining        = true;
         // Run-scoped, so these reset here and nowhere else.
         runExtendUsed_s    = 0.0f;
-        runExtendLiq_s     = 0.0f;
       }
 
       const Step_t &step = activeProfile.steps[activeStep];
@@ -2650,11 +2610,9 @@ void loop()
       // re-judged roughly twice inside its cap, on evidence that has actually
       // accumulated.
       //
-      // It starts optimistic, so a step whose maxDuration is shorter than the
-      // window can enter an extension on no evidence. That is bounded: the
-      // entry gate has already established the oven is within
-      // STEP_EXTEND_ENTRY_C, and the first real verdict lands 20 s in, well
-      // inside STEP_EXTEND_CAP_S and the liquidus budget.
+      // It starts optimistic, which is now load-bearing rather than merely
+      // convenient: it is what stops a step giving up inside its first window,
+      // however slowly the oven happens to be moving when the window opens.
       float gainWindow_s = (time_ms - stepGainRef_ms) / 1000.0f;
       float gainFloor    = STEP_EXTEND_MIN_RATE_C_S;
       if (gainWindow_s * 1000.0f >= STEP_EXTEND_GAIN_WINDOW_MS)
@@ -2668,63 +2626,48 @@ void loop()
 
       float miss_C = (float)step.targetTemp - aktSystemTemperature;
 
-      // Enter an extension: overrun its slow bound, short of target, heating,
-      // and still genuinely climbing. How far short is deliberately not asked
-      // -- see the note where STEP_EXTEND_ENTRY_C used to be defined.
+      // A HEATING STEP HAS NO TIME LIMIT. It ends when it reaches its target,
+      // or when the oven proves it cannot.
       //
-      // `reached` is the projection, so this never fights the deliberate early
-      // cut: a step that projects to arrive is not short, and ends normally
-      // through the ordinary advance below. A dead element is short and NOT
-      // gaining, so it never gets here either -- it falls through to the
-      // STEP_MISS_C check in the same window it always did.
-      if (overrun && !reached && !isDwell && dir > 0.0f && gaining &&
-          !stepExtending &&
-          runExtendUsed_s < RUN_EXTEND_BUDGET_S &&
-          runExtendLiq_s  < RUN_EXTEND_LIQ_S)
-      {
-        stepExtending     = true;
-        stepExtendStart_s = elapsed_s;
-        Serial.printf("Step %u extended at %.0fs, %.1fC short of %dC\n",
-                      activeStep, elapsed_s, miss_C, step.targetTemp);
-      }
+      // There used to be an extension budget here -- 45 s per step, 60 s per
+      // run, 12 s of that above liquidus -- and it was the wrong shape of
+      // rule. A budget answers "how long am I allowed to keep trying", and
+      // nothing useful turns on the answer: the operator cannot replace a
+      // heater with a board in the chamber, so a step that runs out of budget
+      // hands forward a shortfall nobody can act on. Every downstream step
+      // then starts cold, and the peak arrives short. On 2026-09-04 that ended
+      // a run 3 degC below a 170 degC target with the paste half soaked.
+      //
+      // The question worth asking is physical, and it was already being
+      // computed: IS THE OVEN STILL CLIMBING. While it is, waiting costs time
+      // and gains temperature, which is the trade the profile wants. Once it
+      // has plateaued below target at power, waiting costs time and gains
+      // nothing -- the oven cannot get there and only the board is paying. So
+      // that, and not a clock, is what ends the attempt.
+      //
+      // `gaining` is a temperature difference across STEP_EXTEND_GAIN_WINDOW_MS
+      // and starts optimistic at each step, so a step cannot give up inside
+      // its first window however slowly it is moving.
+      //
+      // KNOWN COST, deliberately accepted: RUN_EXTEND_LIQ_S also bounded time
+      // above liquidus, and nothing bounds it now. A slow oven can sit above
+      // 217 degC for as long as it keeps inching upward, which damages joints
+      // by soak rather than by peak. The judgement is that a board which never
+      // reaches peak was not going to reflow anyway.
+      //
+      // Cooling steps and dwells keep their timers. Nothing drives a descent,
+      // so a cooling step that waited for its target would wait forever, and a
+      // dwell's duration is the whole point of it.
+      stepExtending = overrun && !reached && !isDwell && dir > 0.0f && gaining;
+      if (stepExtending) runExtendUsed_s += 0.1f;   // reported, not budgeted
 
-      if (stepExtending)
-      {
-        float ext_s = elapsed_s - stepExtendStart_s;
-        // Charged per 100 ms pass. Only time actually spent above liquidus
-        // counts against the tighter budget -- that is the exposure that
-        // damages the board, and a long sub-liquidus extension does not.
-        runExtendUsed_s += 0.1f;
-        if (aktSystemTemperature >= LIQUIDUS_C) runExtendLiq_s += 0.1f;
+      // Plateaued below target with the clock already past maxDuration: the
+      // oven has given what it can and there is nothing left to wait for.
+      bool gaveUp = overrun && !reached && !isDwell && dir > 0.0f && !gaining;
 
-        if (ext_s >= STEP_EXTEND_CAP_S ||
-            runExtendUsed_s >= RUN_EXTEND_BUDGET_S ||
-            runExtendLiq_s  >= RUN_EXTEND_LIQ_S)
-        {
-          reportWarning("Extended step never reached target");
-          stepExtending = false;  // fall through to the ordinary advance
-        }
-        else if (!gaining)
-        {
-          // Stopped climbing: the oven has given what it can. Faulting on a
-          // miss of a degree or two would be a new false alarm where today the
-          // step simply advances, and the projection catches nearly everything
-          // that close anyway -- at the default 20 s lag even 0.05 degC/s of
-          // climb puts projectedTemp over the target.
-          stepExtending = false;
-          if (miss_C > DWELL_BAND_C)
-          {
-            reportWarning("Extended step stalled short of target");
-          }
-        }
-      }
+      bool timedOut = overrun && (isDwell || dir <= 0.0f);
 
-      // Suspending the duration watchdog is the whole of what an extension
-      // does. Its rate bounds stayed in force throughout, by way of the
-      // hoisted fast-bound clamp above.
-      bool timedOut = overrun && !stepExtending;
-
-      if ((minMet && reached) || timedOut)
+      if ((minMet && reached) || timedOut || gaveUp)
       {
         // Timed out a long way short on a heating step. Without a check here
         // a dead element runs the whole profile through to Complete having
@@ -2738,15 +2681,13 @@ void loop()
         // refused to wait. Wrong diagnosis, and it sent the operator looking
         // at the element.
         //
-        // A gaining step reaching here has exhausted its extension budget,
-        // which is a scheduling failure and says nothing about the element.
-        // Only a step that is short AND not climbing is evidence of one.
-        if (timedOut && !reached && dir > 0.0f &&
-            (step.targetTemp - aktSystemTemperature) > STEP_MISS_C)
+        // Only reachable by gaveUp now, a heating step having no timeout:
+        // short of target AND no longer climbing. That is the one shape of
+        // evidence that says something about the element rather than about
+        // the schedule.
+        if (gaveUp && (step.targetTemp - aktSystemTemperature) > STEP_MISS_C)
         {
-          reportWarning(gaining
-            ? "Out of extension budget, still short of target"
-            : "Oven not heating: step timed out short of target");
+          reportWarning("Oven stopped climbing short of target");
         }
 
         activeStep++;
