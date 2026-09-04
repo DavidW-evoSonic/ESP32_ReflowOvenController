@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.9.0"
+#define FW_VERSION "2.10.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -437,10 +437,14 @@ static_assert(ONTIME_FOR_LEVEL(POWER_LEVELS - 2)
 // alone is not evidence of anything on a COOLING step, because that corridor
 // is a timer -- the note at defaultSteps already says a cooling step's
 // declared duration says nothing about where the temperature is. The last
-// step drives the corridor from 150 to 30 degC in 20-30 s; the oven coasts
-// down far slower than that, so the gap opens past 100 degC on a healthy oven
-// every time. A board-mounted probe widens it further, since a board sheds
-// heat far more slowly than the air probe this was sized against.
+// step used to drive the corridor from 150 to 30 degC in 20-30 s while the
+// oven coasted down far slower, so the gap opened past 100 degC on a healthy
+// oven every time. A board-mounted probe widened it further, since a board
+// sheds heat far more slowly than the air probe that was sized against.
+//
+// The descent is sized to measured cooling since 2.10.0, so that particular
+// gap should no longer open. The climb requirement stays regardless: it is
+// what makes this test answer the question it claims to.
 //
 // So the run ended in "Temperature is Way to HOT!!!!!" with the relay open,
 // the element cold and the oven falling at 1.8 degC/s -- a hardware
@@ -1381,9 +1385,40 @@ void makeDefaultProfile() {
                                         // FELL for ten seconds at 100% duty.
                                         // That is recovery lag, not ceiling.
     { 245,  30,  45, BOUND_DURATION },  // dwell at peak; holds for 30 s
-    { 220,  21,  28, BOUND_DURATION },
-    { 150,  30,  45, BOUND_DURATION },
-    {  30,  20,  30, BOUND_DURATION },
+    // THE DESCENT, SIZED TO WHAT THE OVEN ACTUALLY DOES.
+    //
+    // These were 220/21-28, 150/30-45 and 30/20-30: about 100 s to describe a
+    // descent that measured 450 s and still had not finished. Every one of
+    // them timed out, so the corridor plunged 245 -> 30 while the board sat at
+    // 212, the target dived away from the trace, and the run declared Complete
+    // at 212 degC with the board still molten 5 degC earlier.
+    //
+    // Measured on the 2026-09-04 pasted run, from a 248.2 peak, door opened at
+    // the prompt:
+    //
+    //     230-250  0.41 degC/s      130-150  0.42
+    //     210-230  0.59             110-130  0.34
+    //     190-210  0.59              90-110  0.25
+    //     170-190  0.52              70- 90  0.19
+    //     150-170  0.50
+    //
+    // So the durations below are the real thing, and each step now ends on the
+    // thermometer instead of on its watchdog.
+    //
+    // The slope cannot be made truly constant. Cooling is Newtonian -- the
+    // rate falls with the gap to ambient -- so a single straight line either
+    // outruns the oven at the bottom or lags it at the top. These three
+    // segments sit at 0.45, 0.52 and 0.34 degC/s, which reads as one coherent
+    // descent rather than a cliff.
+    //
+    // The last step ends at 100, not 30. 30 degC is asymptotic: the run was
+    // still at 76 degC after 450 s and would have spent another 20 minutes
+    // reaching for a number it may never touch, holding the UI in Running the
+    // whole time. Nothing is driven during a descent -- COOLDOWN_MAX_LEVEL is
+    // 0 -- so the only thing a longer step buys is an honest graph.
+    { 220,  45,  75, BOUND_DURATION },  // 0.33-0.56 degC/s, measured 0.45
+    { 150, 115, 170, BOUND_DURATION },  // 0.41-0.61 degC/s, measured 0.52
+    { 100, 120, 200, BOUND_DURATION },  // 0.25-0.42 degC/s, measured 0.34
   };
   activeProfile.stepCount = sizeof(defaultSteps)/sizeof(defaultSteps[0]);
   memcpy(activeProfile.steps, defaultSteps, sizeof(defaultSteps));
