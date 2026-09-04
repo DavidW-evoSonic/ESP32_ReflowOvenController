@@ -45,3 +45,8 @@ logs/
 REWORK_NOTES.md
 HARDWARE_CHECKS.md
 PORTING_ANALYSIS.md
+
+# Screenshots of the oven UI. The browser address bar in one carries the LAN
+# address, which is the same thing the history purge existed to remove.
+Screenshot*.png
+screenshot*.png
