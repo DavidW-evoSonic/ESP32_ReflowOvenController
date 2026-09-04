@@ -46,7 +46,27 @@ REWORK_NOTES.md
 HARDWARE_CHECKS.md
 PORTING_ANALYSIS.md
 
-# Screenshots of the oven UI. The browser address bar in one carries the LAN
-# address, which is the same thing the history purge existed to remove.
-Screenshot*.png
-screenshot*.png
+# NO SCREENSHOTS, EVER.
+#
+# One of the oven page carries the LAN address in the browser address bar --
+# the same class of thing the 2026-09-04 history purge removed -- and a run
+# trace is oven-specific information that does not leave this machine.
+#
+# Screenshot tools drop their output in the repo root, so the root is closed to
+# images entirely rather than trying to guess every naming convention. This
+# does NOT disturb the images already tracked: .gitignore has no effect on a
+# tracked file, so images/ and the existing root photos stay exactly as they
+# are. If a genuinely wanted image ever needs to live in the root, "git add -f"
+# is the deliberate override.
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+/*.bmp
+
+# ...and by name, wherever they land.
+Screenshot*
+screenshot*
+Screen Shot*
+*screen_shot*
