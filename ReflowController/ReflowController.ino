@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.5.0"
+#define FW_VERSION "2.6.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -1248,9 +1248,18 @@ void makeDefaultProfile() {
   // run ended with the air at 221 degC and the solder unmelted.
   //
   // A dwell trades apex height for time at temperature, which is what
-  // actually transfers heat into a board, so the peak comes down to 240 as it
-  // gains a hold. Lower is also kinder to parts -- plenty are rated 245-260
-  // peak -- and 3 degC of air temperature was never what the joints saw.
+  // actually transfers heat into a board, so the peak gained a hold.
+  //
+  // 240 -> 245 on 2026-09-04, after the first run that actually reflowed. It
+  // did, but only in the last few seconds, which is no margin at all: the peak
+  // measured 237 against a 240 target, and every degree between the joints and
+  // liquidus is time the paste is not flowing. 245 buys ~8 degC over what that
+  // run delivered.
+  //
+  // This is now a BOARD temperature and a calibrated one, so 245 means 245 at
+  // the joints -- not an air reading that flattered them by 20 degC. Parts
+  // rated 245-260 peak have real but not generous margin here, which is why
+  // this went to 245 and not higher.
   //
   // Time above liquidus is the constraint that bounds all of this: 217 degC,
   // 60-90 s for SAC305.
@@ -1290,8 +1299,8 @@ void makeDefaultProfile() {
   static const Step_t defaultSteps[] = {
     { 170,  72,  94, BOUND_RATE     },  // 0.72-0.94 degC/s
     { 220,  31,  64, BOUND_DURATION },
-    { 240,  21,  28, BOUND_DURATION },
-    { 240,  30,  45, BOUND_DURATION },  // dwell at peak; holds for 30 s
+    { 245,  21,  28, BOUND_DURATION },
+    { 245,  30,  45, BOUND_DURATION },  // dwell at peak; holds for 30 s
     { 220,  21,  28, BOUND_DURATION },
     { 150,  30,  45, BOUND_DURATION },
     {  30,  20,  30, BOUND_DURATION },
@@ -2529,7 +2538,29 @@ void loop()
       // Still a clamp and not a latch: if the climb decays and the projection
       // falls back below the target, the corridor gets its authority back at
       // the next control interval and drives again.
-      if (!isDwell && dir > 0.0f && projectedTemp >= step.targetTemp)
+      //
+      // EXCEPT where the next step is hotter, and this is not a detail. The
+      // clamp exists to stop the oven sailing past a ceiling, and a step
+      // leading into a hotter one has no ceiling -- the same reasoning that
+      // already makes such a step advance on the thermometer rather than on
+      // the projection.
+      //
+      // Left ungated the two rules fight, and the clamp wins: the step waits
+      // for the measurement to cross the target while the clamp refuses to
+      // heat toward it, so the only thing that closes the gap is coasting.
+      // Measured on the 2026-09-04 run -- 57 s parked a degree under 170 and
+      // 45 s parked a degree under 220, over a hundred seconds of a reflow
+      // profile with the element off and the corridor asking for power the
+      // whole time. The flux pays for that and the joints get nothing.
+      //
+      // The fast rate bound is hoisted below and still governs every branch,
+      // so this cannot run away: a step may arrive hot, but not faster than
+      // the ramp the profile declared.
+      bool nextHotter = (activeStep + 1 < activeProfile.stepCount) &&
+                        (activeProfile.steps[activeStep + 1].targetTemp
+                           > step.targetTemp);
+      if (!isDwell && dir > 0.0f && !nextHotter &&
+          projectedTemp >= step.targetTemp)
       {
         powerLevel = 0;
       }
@@ -2588,9 +2619,8 @@ void loop()
       // Note the two fixes converge: once a step genuinely reaches its target,
       // the corridor anchoring below has nothing left to carry forward, and
       // stepStartTemp is the measurement again.
-      bool nextHotter = (activeStep + 1 < activeProfile.stepCount) &&
-                        (activeProfile.steps[activeStep + 1].targetTemp
-                           > step.targetTemp);
+      // nextHotter is computed above, at the approach clamp, which is the
+      // other half of this same rule.
       bool reached  = isDwell ||
                       (dir > 0.0f
                          ? (nextHotter
