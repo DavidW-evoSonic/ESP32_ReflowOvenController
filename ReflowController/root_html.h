@@ -605,6 +605,7 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             };
             xhr.onload = function(){
                 $('#ota_stat').text(xhr.responseText || ("HTTP "+xhr.status));
+                if(xhr.status === 200) otaRebootWait();
             };
             // The board reboots the moment it has answered, so a dropped
             // connection after a 200 is success, not failure.
@@ -612,6 +613,49 @@ const char ROOT_HTML[] PROGMEM = R"=====(
             $('#ota_stat').text("uploading\u2026");
             xhr.send(fd);
         });
+
+        // Wait out the reboot and reload when the oven answers again.
+        //
+        // Polled rather than a fixed timer. A restart is nominally ~10 s but it
+        // is not a constant -- WiFi association is the slow, variable part --
+        // and a fixed wait either reloads into a dead host or sits there long
+        // after the oven is back. Reloading on the first answer is both faster
+        // and more reliable than guessing.
+        function otaRebootWait(){
+            var t0 = Date.now(), done = false;
+            $('#wait').show();
+            $('#wait_now').click(function(){ location.reload(); });
+
+            function tick(){
+                if(done) return;
+                var secs = Math.round((Date.now() - t0)/1000);
+                $('#wait_dots').text("waiting for the oven\u2026 " + secs + "s");
+
+                if(secs > 90){
+                    $('#wait_msg').text("The oven has not answered in 90 s. It "
+                        + "may still be starting, or it may need a power cycle.");
+                    $('#wait_now').show();
+                    return;                      // stop polling, hand it over
+                }
+
+                // Do not probe for the first few seconds. The old firmware is
+                // still answering when it replies to the upload -- it restarts
+                // 200 ms later -- so an early hit would reload us straight back
+                // into the version we just replaced and report success.
+                if(secs < 4){ setTimeout(tick, 1000); return; }
+
+                $.ajax({url: "/config?t=" + Date.now(),
+                        dataType: "json", timeout: 1500})
+                 .done(function(c){
+                     done = true;
+                     $('#wait_msg').text("Back up on "
+                         + (c.version || "the new firmware") + ". Reloading\u2026");
+                     setTimeout(function(){ location.reload(); }, 600);
+                 })
+                 .fail(function(){ setTimeout(tick, 1000); });
+            }
+            tick();
+        }
 
         $('#toggle').click(function(){ $('#panel').toggle(); });
 
@@ -776,6 +820,22 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         </div>
     </div>
     <div id="chart_div"></div>
+    </div>
+
+    <!-- Shown only while the oven is rebooting into new firmware. Covers the
+         page because everything under it is stale the moment the upload
+         lands: the status poll is talking to a board that is going away. -->
+    <div id="wait" style="display:none; position:fixed; left:0; top:0;
+         right:0; bottom:0; z-index:9999; background:rgba(0,0,0,0.85);
+         color:#fff; text-align:center; padding-top:14vh;
+         font-family:sans-serif">
+      <div style="font-size:26px; font-weight:bold">Installing firmware</div>
+      <div id="wait_msg" style="margin-top:14px; font-size:17px">
+        The oven is rebooting. This page will reload by itself.</div>
+      <div id="wait_dots" style="margin-top:20px; font-size:14px;
+           opacity:0.8">&nbsp;</div>
+      <button id="wait_now" style="margin-top:24px; display:none">
+        Reload now</button>
     </div>
   </body>
 

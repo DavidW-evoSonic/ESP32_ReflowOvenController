@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.11.0"
+#define FW_VERSION "2.12.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
