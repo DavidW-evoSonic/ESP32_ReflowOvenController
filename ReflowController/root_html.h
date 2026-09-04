@@ -311,8 +311,10 @@ const char ROOT_HTML[] PROGMEM = R"=====(
              {
                  // Returning to Ready does NOT clear the chart. It used to,
                  // and that threw away the trace at the worst moment: the
-                 // firmware keeps no run history, so between Complete and the
-                 // Download Graph button this tab holds the only copy. On
+                 // firmware kept no run history until 2.9.0, so between
+                 // Complete and the Download Graph button this tab held the
+                 // only copy. /history is the durable one now, but a chart
+                 // that erases itself is still wrong. On
                  // 2026-09-04 a faulted run went Complete -> Ready on a /stop
                  // and took its own evidence with it.
                  //
@@ -679,6 +681,8 @@ const char ROOT_HTML[] PROGMEM = R"=====(
         Action: &nbsp;&nbsp;&nbsp;<button id="action" ></button>
         <button id="toggle">Settings</button> <br>
         <a id="export" href="#">Download Graph</a>
+        &nbsp;|&nbsp;
+        <a href="/history" download>Download Run (firmware)</a>
         <div id="fault" style="display:none; color:#fff; background:#c00; padding:4px; margin-top:4px; font-weight:bold"></div>
         <div id="warn" style="display:none; color:#000; background:#fd7; border:1px solid #a70; padding:4px; margin-top:4px"></div>
 

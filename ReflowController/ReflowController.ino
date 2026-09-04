@@ -41,7 +41,7 @@
 // Emitted by /config and printed at boot. Deliberately NOT in /status: that is
 // polled once a second into a fixed 512-byte buffer that is already most of
 // the way full, and a constant does not belong in a per-second poll.
-#define FW_VERSION "2.8.0"
+#define FW_VERSION "2.9.0"
 #define FW_BUILD   __DATE__ " " __TIME__
 
 //Devdefins
@@ -951,6 +951,41 @@ float mcuTemp_C = 0.0f;
 float stepStartTemp;    // measured temperature when the step began
 uint8_t powerLevel = 0; // 0..POWER_LEVELS-1, what the corridor law is asking for
 
+// Last run, one sample a second, so a run is recoverable without anyone having
+// remembered to start an external logger. The chart in the browser tab was the
+// only other copy and it dies with the tab.
+//
+// A true ring rather than fill-and-stop: with no time limit on a heating step
+// since 2.5.0 a slow run can outlast any fixed buffer, and losing the start of
+// one is better than losing its peak.
+//
+// Sized so a whole cycle plus its cooldown fits without wrapping -- a 480 s run
+// and ~600 s of coast is about 1080 -- because wrapping costs the preheat.
+// 1200 samples at 14 bytes is under 17 KB against 15% RAM in use.
+#define HISTORY_SAMPLES     1200
+// Stop recording the coast here. Without a floor the oven sits in Complete for
+// as long as nobody presses Reset, and the ring would eat the run it captured.
+#define HISTORY_COAST_STOP_C  50.0f
+
+typedef struct {
+  uint16_t t_s;                                   // since cycleStartTime
+  int16_t  temp_c10, setp_c10, low_c10, high_c10; // degC * 10
+  uint8_t  power_pct;
+  uint8_t  step;
+  uint8_t  state;
+} HistSample_t;
+
+HistSample_t history[HISTORY_SAMPLES];
+uint16_t histCount = 0;   // valid samples, saturating at HISTORY_SAMPLES
+uint16_t histHead  = 0;   // next write index
+
+static inline int16_t histC10(float v)
+{
+  if (v >  3200.0f) v =  3200.0f;   // snprintf-proof, not physics
+  if (v < -3200.0f) v = -3200.0f;
+  return (int16_t)(v * 10.0f);
+}
+
 uint64_t cycleStartTime=0;
 
 
@@ -1644,6 +1679,38 @@ void setup() {
       stepExtending ? 1 : 0, runExtendUsed_s, mcuTemp_C,
       currentStateToString(), globalErrorText, globalWarningText);
     server.send(200, "application/json", buffer);
+  });
+  // The last run, as CSV, straight into a spreadsheet or tools/heatrate.py.
+  // Chunked rather than built into a String: 1200 rows is ~50 KB and the heap
+  // will not hand that over in one piece.
+  server.on("/history", []() {
+    server.sendHeader("Cache-Control","no-cache");
+    server.sendHeader("Content-Disposition",
+                      "attachment; filename=\"ovenrun.csv\"");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/csv", "");
+    server.sendContent("time,temp,setpoint,low,high,power,step,state\n");
+
+    // Oldest first. Once the ring has wrapped that is the write head.
+    uint16_t start = (histCount == HISTORY_SAMPLES) ? histHead : 0;
+    char buf[900];
+    size_t used = 0;
+    for (uint16_t i = 0; i < histCount; i++)
+    {
+      const HistSample_t &h = history[(start + i) % HISTORY_SAMPLES];
+      used += snprintf(buf + used, sizeof(buf) - used,
+                       "%u,%.1f,%.1f,%.1f,%.1f,%u,%u,%u\n",
+                       h.t_s, h.temp_c10 / 10.0f, h.setp_c10 / 10.0f,
+                       h.low_c10 / 10.0f, h.high_c10 / 10.0f,
+                       h.power_pct, h.step, h.state);
+      if (used > sizeof(buf) - 64)   // next row may not fit
+      {
+        server.sendContent(buf);
+        used = 0;
+      }
+    }
+    if (used) server.sendContent(buf);
+    server.sendContent("");   // terminating chunk
   });
   // Slot directory for the profile picker: every slot, named or free.
   server.on("/profiles", []() {
@@ -2351,6 +2418,14 @@ void loop()
     if (currentState != previousState)
     {
       stateChanged = true;
+      // A cycle beginning retires the previous run's history. Running ->
+      // Complete is NOT a beginning, so the coast keeps appending to the run
+      // it belongs to.
+      if (currentState > ProcessStart && previousState <= ProcessStart)
+      {
+        histCount = 0;
+        histHead  = 0;
+      }
       previousState = currentState;
       // Any transition ends an extension. This has to live here rather than in
       // the Running block, because /stop assigns currentState = Complete
@@ -3127,6 +3202,27 @@ void loop()
       // is being held somewhere it is not. Hold is excluded because it does
       // define one -- its deadband, set in its own branch.
       corridorLow = corridorHigh = heaterSetpoint = aktSystemTemperature;
+    }
+
+    // Run history, 1 Hz. This block runs at 10 Hz, hence the gate.
+    static uint64_t lastHistSample_ms = 0;
+    bool histActive = (currentState > ProcessStart) &&
+                      (currentState != Complete ||
+                       aktSystemTemperature > HISTORY_COAST_STOP_C);
+    if (histActive && time_ms - lastHistSample_ms >= 1000)
+    {
+      lastHistSample_ms = time_ms;
+      HistSample_t &h = history[histHead];
+      h.t_s       = (uint16_t)((esp_timer_get_time() - cycleStartTime) / 1000000);
+      h.temp_c10  = histC10(aktSystemTemperature);
+      h.setp_c10  = histC10(heaterSetpoint);
+      h.low_c10   = histC10(corridorLow);
+      h.high_c10  = histC10(corridorHigh);
+      h.power_pct = (uint8_t)((powerHeater * 100 + 127) / 255);
+      h.step      = activeStep;
+      h.state     = (uint8_t)currentState;
+      histHead = (histHead + 1) % HISTORY_SAMPLES;
+      if (histCount < HISTORY_SAMPLES) histCount++;
     }
   }
 
